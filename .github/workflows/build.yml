@@ -12,12 +12,18 @@ jobs:
 
       - uses: arduino/setup-arduino-cli@v2
 
-      - name: Install ESP8266 core
+      - name: Install ESP8266 core (retry)
         run: |
           arduino-cli config init
           arduino-cli config add board_manager.additional_urls https://arduino.esp8266.com/stable/package_esp8266com_index.json
           arduino-cli core update-index
-          arduino-cli core install esp8266:esp8266
+          for i in 1 2 3 4 5 6; do
+            if arduino-cli core install esp8266:esp8266; then
+              echo "core installed"; exit 0
+            fi
+            echo "Download fail, retry $i..."; sleep 15
+          done
+          exit 1
 
       - name: Compile
         run: |

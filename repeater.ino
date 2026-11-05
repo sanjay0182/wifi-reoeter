@@ -26,6 +26,7 @@
 #define CFG_MAGIC 0xA5A50002
 #define CFG_MAGIC2 0x5A5A0001
 #define CFG_MAGIC3 0x5A5A0003
+#define CFG_MAGIC4 0x5A5A0004
 
 struct Config {
   uint32_t magic;
@@ -42,6 +43,8 @@ struct Config {
   char pHost[65];   // proxy ka host/IP
   uint32_t magic3;
   char dns[16];     // custom DNS (khali = router wala)
+  uint32_t magic4;
+  uint8_t apOct;    // repeater network: 10.10.<apOct>.1
 };
 
 Config cfg;
@@ -107,6 +110,11 @@ void loadConfig() {
     cfg.magic3 = CFG_MAGIC3;
     memset(cfg.dns, 0, sizeof(cfg.dns));
   }
+  if (cfg.magic4 != CFG_MAGIC4) {
+    cfg.magic4 = CFG_MAGIC4;
+    cfg.apOct = 10;
+  }
+  if (cfg.apOct < 1 || cfg.apOct > 254) cfg.apOct = 10;
   cfg.dns[15] = 0;
   cfg.pHost[64] = 0;
   cfg.rSsid[32] = 0; cfg.rPass[64] = 0;
@@ -265,6 +273,8 @@ void handleRoot() {
   h += esc(String(cfg.aPass));
   h += F("'><label>DNS (khali = router wala, jaise 8.8.8.8)</label><input name=dn value='");
   h += esc(String(cfg.dns));
+  h += F("'><label>Repeater network number (10.10.__.1). Repeater ko repeater se jodo to alag rakho</label><input name=an type=number min=1 max=254 value='");
+  h += String(cfg.apOct);
   h += F("'><label>Panel ka password (khali = purana)</label><input name=ad value=''>");
   h += F("<button type=submit>Save aur restart</button></form></div>");
   server.sendContent(h);
@@ -330,13 +340,14 @@ void handleSave() {
   String as = server.arg("as");
   String ap = server.arg("ap");
   String ad = server.arg("ad");
+  int an = server.arg("an").toInt();
   String dn = server.arg("dn");
   dn.trim();
   IPAddress dtest;
   bool dnsBad = dn.length() > 0 && (dn.length() > 15 || !dtest.fromString(dn));
   if (as.length() < 1 || as.length() > 32 || rs.length() > 32 || rp.length() > 64 ||
       ap.length() > 64 || (ap.length() > 0 && ap.length() < 8) ||
-      ad.length() > 32 || (ad.length() > 0 && ad.length() < 4) || dnsBad) {
+      ad.length() > 32 || (ad.length() > 0 && ad.length() < 4) || dnsBad || an < 1 || an > 254) {
     server.send(400, "text/html",
       "<meta name='viewport' content='width=device-width,initial-scale=1'>"
       "<body style='font-family:sans-serif;padding:16px'>Galat input. Repeater password 8+ character ka ho (ya khali), panel password 4+ ka, DNS sahi IP ho (jaise 8.8.8.8). <a href='/'>Wapas</a></body>");
@@ -352,6 +363,7 @@ void handleSave() {
   strncpy(cfg.aPass, ap.c_str(), 64);
   memset(cfg.dns, 0, sizeof(cfg.dns));
   strncpy(cfg.dns, dn.c_str(), 15);
+  cfg.apOct = (uint8_t)an;
   if (ad.length() > 0) {
     memset(cfg.admin, 0, sizeof(cfg.admin));
     strncpy(cfg.admin, ad.c_str(), 32);
@@ -359,7 +371,7 @@ void handleSave() {
   saveConfig();
   server.send(200, "text/html",
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<body style='font-family:sans-serif;padding:16px'>Save ho gaya. Restart ho raha hai, 20 second baad dobara judo.</body>");
+    "<body style='font-family:sans-serif;padding:16px'>Save ho gaya. Restart ho raha hai, 20 second baad dobara judo. Panel ab http://10.10.NETWORK.1 par khulega (jo network number daala).</body>");
   delay(1500);
   ESP.restart();
 }
@@ -445,6 +457,7 @@ void setup() {
   pinMode(0, INPUT_PULLUP);   // FLASH button: 5 sec dabao = factory reset
 
   // Pehle repeater WiFi + panel chalu (router mile ya na mile, panel hamesha khulega)
+  apIP = IPAddress(10, 10, cfg.apOct, 1);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
   WiFi.softAP(cfg.aSsid, strlen(cfg.aPass) >= 8 ? cfg.aPass : nullptr, 1, 0, 8);
 
@@ -473,6 +486,15 @@ void loop() {
   if (ok) {
     if (!wasOk) {            // abhi-abhi juda (pehli baar ya router wapas aaya)
       wasOk = true;
+      IPAddress li = WiFi.localIP();
+      if (li[0] == apIP[0] && li[1] == apIP[1] && li[2] == apIP[2]) {
+        // Router ka network aur repeater ka network same (jaise repeater 1 -> repeater 2): net nahi chalega.
+        // Apne aap alag network chuno aur restart.
+        cfg.apOct = (apIP[2] == 10) ? 20 : 10;
+        saveConfig();
+        delay(300);
+        ESP.restart();
+      }
       netLat = -2;
       lastNet = 0;
       enableNapt();

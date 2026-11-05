@@ -7,6 +7,7 @@
 // LED (blue, NodeMCU): router nahi juda = 2 sec me chhota flash | juda par net nahi = LED jalti rahe |
 //   net hai = blink: tez blink = net fast, dheere blink = net slow.
 // Router band/password galat ho to bhi repeater WiFi + panel chalta rahega, aur router ko baar-baar try karta rahega.
+// FLASH button 5 sec dabao = factory reset. Net 5 min tak na mile to router se dobara judta hai.
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
@@ -15,10 +16,16 @@
 #include <lwip/napt.h>
 #include <lwip/dns.h>
 
-#define NAPT_ENTRIES 1000
+// 1 = CPU 160 MHz, 0 = 80 MHz (speed compare karne ke liye badlo)
+#define USE_160MHZ 1
+// --- Speed switches (max speed test ke liye 0 karke dekho) ---
+#define LED_ENABLED 1   // 0 = LED band (CPU ka kaam kam)
+#define NET_CHECK 1     // 0 = internet ping naapna band (LED bas 'juda hai' dikhayegi)
+#define NAPT_ENTRIES 512
 #define NAPT_PORTS 10
 #define CFG_MAGIC 0xA5A50002
 #define CFG_MAGIC2 0x5A5A0001
+#define CFG_MAGIC3 0x5A5A0003
 
 struct Config {
   uint32_t magic;
@@ -33,6 +40,8 @@ struct Config {
   uint8_t pType;    // 0 = HTTP, 1 = SOCKS5
   uint16_t pPort;
   char pHost[65];   // proxy ka host/IP
+  uint32_t magic3;
+  char dns[16];     // custom DNS (khali = router wala)
 };
 
 Config cfg;
@@ -40,7 +49,8 @@ ESP8266WebServer server(80);
 IPAddress apIP(10, 10, 10, 1);
 bool natOn = false;
 bool wasOk = false;
-uint32_t lastRetry = 0, discSince = 0, lastNet = 0;
+uint32_t lastTick = 0;
+uint32_t lastRetry = 0, discSince = 0, lastNet = 0, badSince = 0, btnSince = 0;
 int netLat = -2;   // -2 = naap rahe, -1 = internet nahi, >=0 = ms
 extern "C" bool wifi_softap_deauth(uint8_t mac[6]) __attribute__((weak));
 #define wifi_softap_deauth_w wifi_softap_deauth
@@ -93,6 +103,11 @@ void loadConfig() {
     cfg.pEn = 0; cfg.pType = 0; cfg.pPort = 8080;
     memset(cfg.pHost, 0, sizeof(cfg.pHost));
   }
+  if (cfg.magic3 != CFG_MAGIC3) {
+    cfg.magic3 = CFG_MAGIC3;
+    memset(cfg.dns, 0, sizeof(cfg.dns));
+  }
+  cfg.dns[15] = 0;
   cfg.pHost[64] = 0;
   cfg.rSsid[32] = 0; cfg.rPass[64] = 0;
   cfg.aSsid[32] = 0; cfg.aPass[64] = 0; cfg.admin[32] = 0;
@@ -137,6 +152,8 @@ bool auth() {
 
 void enableNapt() {
   IPAddress d = WiFi.dnsIP(0);
+  IPAddress custom;
+  if (cfg.dns[0] && custom.fromString(cfg.dns)) d = custom;
   if (d == IPAddress(0, 0, 0, 0)) d = IPAddress(8, 8, 8, 8);
   WiFi.softAPDhcpServer().setDns(d);
   if (!natOn) {
@@ -149,7 +166,7 @@ void enableNapt() {
 
 void measureNet() {
   WiFiClient c;
-  c.setTimeout(1200);   // connect ka timeout (ms)
+  c.setTimeout(500);   // connect ka timeout (ms)
   uint32_t t = millis();
   if (c.connect(IPAddress(1, 1, 1, 1), 443)) {
     netLat = (int)(millis() - t);
@@ -246,6 +263,8 @@ void handleRoot() {
   h += esc(String(cfg.aSsid));
   h += F("'><label>Repeater ka password (8+ ya khali)</label><input name=ap value='");
   h += esc(String(cfg.aPass));
+  h += F("'><label>DNS (khali = router wala, jaise 8.8.8.8)</label><input name=dn value='");
+  h += esc(String(cfg.dns));
   h += F("'><label>Panel ka password (khali = purana)</label><input name=ad value=''>");
   h += F("<button type=submit>Save aur restart</button></form></div>");
   server.sendContent(h);
@@ -311,12 +330,16 @@ void handleSave() {
   String as = server.arg("as");
   String ap = server.arg("ap");
   String ad = server.arg("ad");
+  String dn = server.arg("dn");
+  dn.trim();
+  IPAddress dtest;
+  bool dnsBad = dn.length() > 0 && (dn.length() > 15 || !dtest.fromString(dn));
   if (as.length() < 1 || as.length() > 32 || rs.length() > 32 || rp.length() > 64 ||
       ap.length() > 64 || (ap.length() > 0 && ap.length() < 8) ||
-      ad.length() > 32 || (ad.length() > 0 && ad.length() < 4)) {
+      ad.length() > 32 || (ad.length() > 0 && ad.length() < 4) || dnsBad) {
     server.send(400, "text/html",
       "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-      "<body style='font-family:sans-serif;padding:16px'>Galat input. Repeater password 8+ character ka ho (ya khali), panel password 4+ ka. <a href='/'>Wapas</a></body>");
+      "<body style='font-family:sans-serif;padding:16px'>Galat input. Repeater password 8+ character ka ho (ya khali), panel password 4+ ka, DNS sahi IP ho (jaise 8.8.8.8). <a href='/'>Wapas</a></body>");
     return;
   }
   memset(cfg.rSsid, 0, sizeof(cfg.rSsid));
@@ -327,6 +350,8 @@ void handleSave() {
   strncpy(cfg.rPass, rp.c_str(), 64);
   strncpy(cfg.aSsid, as.c_str(), 32);
   strncpy(cfg.aPass, ap.c_str(), 64);
+  memset(cfg.dns, 0, sizeof(cfg.dns));
+  strncpy(cfg.dns, dn.c_str(), 15);
   if (ad.length() > 0) {
     memset(cfg.admin, 0, sizeof(cfg.admin));
     strncpy(cfg.admin, ad.c_str(), 32);
@@ -402,7 +427,9 @@ void handleReset() {
 }
 
 void setup() {
+#if USE_160MHZ
   system_update_cpu_freq(SYS_CPU_160MHZ);   // NAT ke liye tez CPU (80 -> 160 MHz)
+#endif
   Serial.begin(115200);
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH);
@@ -410,9 +437,12 @@ void setup() {
 
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP_STA);
+  WiFi.setPhyMode(WIFI_PHY_MODE_11N);   // mode n (martin-ger repeater ka default) = sabse tez
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
   WiFi.setOutputPower(20.5);
   WiFi.setAutoReconnect(true);
+  WiFi.hostname("JAAT-Repeater");
+  pinMode(0, INPUT_PULLUP);   // FLASH button: 5 sec dabao = factory reset
 
   // Pehle repeater WiFi + panel chalu (router mile ya na mile, panel hamesha khulega)
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
@@ -447,10 +477,14 @@ void loop() {
       lastNet = 0;
       enableNapt();
     }
-    if (now - lastNet > (netLat < 0 ? 8000UL : 15000UL)) {
+#if NET_CHECK
+    if (now - lastNet > (netLat < 0 ? 10000UL : 60000UL)) {
       lastNet = now;
       measureNet();
     }
+#else
+    netLat = 0;   // naapna band: LED tez blink = router se juda hai
+#endif
   } else {
     if (wasOk) {             // abhi-abhi toota
       wasOk = false;
@@ -465,7 +499,38 @@ void loop() {
     }
   }
 
-  updateLed(ok);
-  if (ESP.getFreeHeap() < 6000) ESP.restart();   // safety: memory khatam ho to restart
-  yield();
+  // Net 5 min se nahi mil raha (par router juda hai) -> router se dobara judo
+  if (ok && netLat == -1) {
+    if (!badSince) badSince = now;
+    else if (now - badSince > 300000UL) {
+      badSince = 0;
+      WiFi.disconnect();
+      WiFi.begin(cfg.rSsid, cfg.rPass);
+    }
+  } else {
+    badSince = 0;
+  }
+
+  // Button + LED har loop me nahi, sirf 20 ms me ek baar (CPU bachane ke liye)
+  if (now - lastTick >= 20) {
+    lastTick = now;
+
+    // FLASH button 5 second dabaye rakho = factory reset (password bhool jao to kaam aata hai)
+    if (digitalRead(0) == LOW) {
+      if (!btnSince) btnSince = now;
+      else if (now - btnSince > 5000UL) {
+        cfg.magic = 0;
+        saveConfig();
+        ESP.restart();
+      }
+    } else {
+      btnSince = 0;
+    }
+
+#if LED_ENABLED
+    updateLed(ok);
+#else
+    digitalWrite(LED_BUILTIN, HIGH);
+#endif
+  }
 }

@@ -11,7 +11,7 @@
 #include <user_interface.h>
 #include <lwip/napt.h>
 #include <lwip/dns.h>
-#include <dhcpserver.h>
+#include <LwipDhcpServer.h>
 
 #define NAPT_ENTRIES 1000
 #define NAPT_PORTS 10

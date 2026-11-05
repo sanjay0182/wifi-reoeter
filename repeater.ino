@@ -27,6 +27,8 @@
 #define CFG_MAGIC2 0x5A5A0001
 #define CFG_MAGIC3 0x5A5A0003
 #define CFG_MAGIC4 0x5A5A0004
+// Repeater ka default network: 10.10.<ye number>.1  (is board ke liye chaho to 20 kar do)
+#define DEFAULT_AP_OCT 10
 
 struct Config {
   uint32_t magic;
@@ -112,9 +114,9 @@ void loadConfig() {
   }
   if (cfg.magic4 != CFG_MAGIC4) {
     cfg.magic4 = CFG_MAGIC4;
-    cfg.apOct = 10;
+    cfg.apOct = DEFAULT_AP_OCT;
   }
-  if (cfg.apOct < 1 || cfg.apOct > 254) cfg.apOct = 10;
+  if (cfg.apOct < 1 || cfg.apOct > 254) cfg.apOct = DEFAULT_AP_OCT;
   cfg.dns[15] = 0;
   cfg.pHost[64] = 0;
   cfg.rSsid[32] = 0; cfg.rPass[64] = 0;

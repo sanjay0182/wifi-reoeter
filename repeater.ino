@@ -1,0 +1,317 @@
+// ESP8266 WiFi Repeater (NAT) + router jaisa admin web panel
+// Board: NodeMCU 1.0 (ESP-12E Module)  |  lwIP Variant: v2 Higher Bandwidth
+//
+// Repeater ke WiFi se judo -> browser me http://10.10.10.1
+// Login: user "admin", password "admin" (pehle login ke baad badal lena)
+// Panel me: status, judhe devices (disconnect button), router scan, settings, restart, reset.
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <EEPROM.h>
+#include <user_interface.h>
+#include <lwip/napt.h>
+#include <lwip/dns.h>
+#include <dhcpserver.h>
+
+#define NAPT_ENTRIES 1000
+#define NAPT_PORTS 10
+#define CFG_MAGIC 0xA5A50002
+
+struct Config {
+  uint32_t magic;
+  char rSsid[33];   // router ka naam
+  char rPass[65];   // router ka password
+  char aSsid[33];   // repeater ka naam
+  char aPass[65];   // repeater ka password (8+ ya khali)
+  char admin[33];   // panel ka password
+};
+
+Config cfg;
+ESP8266WebServer server(80);
+IPAddress apIP(10, 10, 10, 1);
+bool natOn = false;
+
+static const char PAGE_HEAD[] PROGMEM = R"rawliteral(<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>JAAT Repeater</title><style>
+:root{color-scheme:light dark}
+body{font-family:system-ui,sans-serif;max-width:460px;margin:auto;padding:12px}
+.c{border:1px solid #8884;border-radius:12px;padding:12px 14px;margin:0 0 12px}
+h2{margin:6px 0 12px}h3{margin:0 0 8px}
+table{width:100%;border-collapse:collapse}
+td{padding:5px 0;border-bottom:1px solid #8883;font-size:14px}
+td:last-child{text-align:right}
+label{display:block;font-size:13px;margin:8px 0 2px;opacity:.75}
+input,select,button,.b{width:100%;box-sizing:border-box;padding:10px;font-size:16px;margin:2px 0;border-radius:8px;border:1px solid #8886;background:transparent;color:inherit}
+button,.b{text-align:center;display:block;text-decoration:none;cursor:pointer}
+.k{width:auto;display:inline-block;padding:4px 10px;font-size:13px}
+.g{color:#2e9e5b}.r{color:#d9534f}
+</style></head><body><h2>JAAT WiFi Repeater</h2>)rawliteral";
+
+static const char PAGE_TAIL[] PROGMEM = R"rawliteral(<div class=c><h3>Tools</h3>
+<a class=b href='/reboot' onclick="return confirm('Restart karein?')">Restart</a>
+<a class=b href='/reset' onclick="return confirm('Sab settings default ho jayengi. Pakka?')">Factory reset</a></div>
+<script>
+function pk(v){if(v)document.getElementById('rs').value=v;}
+function sc(){
+var b=document.getElementById('sb');b.textContent='Scan ho raha hai...';
+fetch('/scan.json').then(function(r){return r.json();}).then(function(l){
+var s=document.getElementById('sl');
+s.innerHTML='<option value="">-- chuno --</option>';
+l.forEach(function(x){var o=document.createElement('option');o.value=x.s;o.textContent=x.s+' ('+x.r+' dBm'+(x.e?', lock':'')+')';s.appendChild(o);});
+b.textContent='Dobara scan karo';
+}).catch(function(){b.textContent='Scan fail, dobara try karo';});
+}
+</script></body></html>)rawliteral";
+
+void loadConfig() {
+  EEPROM.begin(sizeof(Config));
+  EEPROM.get(0, cfg);
+  if (cfg.magic != CFG_MAGIC) {
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.magic = CFG_MAGIC;
+    strcpy(cfg.rSsid, "ROUTER_WIFI_NAME");   // <-- apne router ka naam (ya panel se badlo)
+    strcpy(cfg.rPass, "ROUTER_PASSWORD");    // <-- router ka password
+    strcpy(cfg.aSsid, "JAAT_Repeater");
+    strcpy(cfg.aPass, "12345678");
+    strcpy(cfg.admin, "admin");
+  }
+  cfg.rSsid[32] = 0; cfg.rPass[64] = 0;
+  cfg.aSsid[32] = 0; cfg.aPass[64] = 0; cfg.admin[32] = 0;
+}
+
+void saveConfig() {
+  EEPROM.put(0, cfg);
+  EEPROM.commit();
+}
+
+String esc(String s) {
+  s.replace("&", "&amp;");
+  s.replace("<", "&lt;");
+  s.replace(">", "&gt;");
+  s.replace("'", "&#39;");
+  s.replace("\"", "&quot;");
+  return s;
+}
+
+String jsonEsc(String s) {
+  s.replace("\\", "\\\\");
+  s.replace("\"", "\\\"");
+  return s;
+}
+
+String row(const String &a, const String &b) {
+  return "<tr><td>" + a + "</td><td>" + b + "</td></tr>";
+}
+
+String uptimeStr() {
+  uint32_t s = millis() / 1000;
+  return String(s / 3600) + "h " + String((s / 60) % 60) + "m";
+}
+
+bool auth() {
+  if (!server.authenticate("admin", cfg.admin)) {
+    server.requestAuthentication();
+    return false;
+  }
+  return true;
+}
+
+void enableNapt() {
+  dhcpSoftAP.dhcps_set_dns(0, WiFi.dnsIP(0));
+  dhcpSoftAP.dhcps_set_dns(1, WiFi.dnsIP(1));
+  err_t ret = ip_napt_init(NAPT_ENTRIES, NAPT_PORTS);
+  if (ret == ERR_OK) ret = ip_napt_enable_no(SOFTAP_IF, 1);
+  natOn = (ret == ERR_OK);
+  Serial.println(natOn ? "NAT chalu" : "NAT fail (lwIP variant check karo)");
+}
+
+void handleRoot() {
+  if (!auth()) return;
+  bool ok = WiFi.status() == WL_CONNECTED;
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+  server.sendContent_P(PAGE_HEAD);
+
+  String h = F("<div class=c><h3>Status</h3><table>");
+  h += row("Router", ok ? "<span class=g>Juda hua</span>" : "<span class=r>Nahi juda</span>");
+  h += row("Router naam", esc(String(cfg.rSsid)));
+  if (ok) {
+    int r = WiFi.RSSI();
+    String q = (r > -60) ? "badhiya" : (r > -75 ? "theek" : "kamzor");
+    h += row("Router se mila IP", WiFi.localIP().toString());
+    h += row("Signal", String(r) + " dBm (" + q + ")");
+    h += row("Channel", String(WiFi.channel()));
+  }
+  h += row("Repeater WiFi", esc(String(cfg.aSsid)));
+  h += row("Repeater IP", apIP.toString());
+  h += row("Internet sharing (NAT)", natOn ? "<span class=g>Chalu</span>" : "<span class=r>Band</span>");
+  h += row("Uptime", uptimeStr());
+  h += row("Free RAM", String(ESP.getFreeHeap() / 1024) + " KB");
+  h += F("</table></div>");
+
+  h += F("<div class=c><h3>Judhe devices (");
+  h += WiFi.softAPgetStationNum();
+  h += F(")</h3><table>");
+  struct station_info *si = wifi_softap_get_station_info();
+  if (!si) h += F("<tr><td>Koi device nahi juda</td></tr>");
+  while (si) {
+    char mac[18];
+    snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+             si->bssid[0], si->bssid[1], si->bssid[2], si->bssid[3], si->bssid[4], si->bssid[5]);
+    IPAddress ip(si->ip.addr);
+    h += "<tr><td>" + String(mac) + "<br>" + ip.toString() + "</td><td>";
+    h += "<a class='b k' href='/kick?mac=" + String(mac) + "' onclick=\"return confirm('Disconnect karein?')\">Disconnect</a></td></tr>";
+    si = STAILQ_NEXT(si, next);
+  }
+  wifi_softap_free_station_info();
+  h += F("</table><a class=b href='/'>Refresh</a></div>");
+  server.sendContent(h);
+
+  h = F("<div class=c><h3>Settings</h3><form method=POST action='/save'>");
+  h += F("<label>Router WiFi (jisse net lena hai)</label>");
+  h += F("<select id=sl onchange='pk(this.value)'><option value=''>-- scan karke chuno --</option></select>");
+  h += F("<button type=button id=sb onclick='sc()'>Scan karo</button>");
+  h += F("<label>Router ka naam</label><input id=rs name=rs value='");
+  h += esc(String(cfg.rSsid));
+  h += F("'><label>Router ka password</label><input name=rp value='");
+  h += esc(String(cfg.rPass));
+  h += F("'><label>Repeater ka naam</label><input name=as value='");
+  h += esc(String(cfg.aSsid));
+  h += F("'><label>Repeater ka password (8+ ya khali)</label><input name=ap value='");
+  h += esc(String(cfg.aPass));
+  h += F("'><label>Panel ka password (khali = purana)</label><input name=ad value=''>");
+  h += F("<button type=submit>Save aur restart</button></form></div>");
+  server.sendContent(h);
+
+  server.sendContent_P(PAGE_TAIL);
+  server.sendContent("");
+}
+
+void handleScan() {
+  if (!auth()) return;
+  int n = WiFi.scanNetworks();
+  String j = "[";
+  for (int i = 0; i < n; i++) {
+    if (i) j += ",";
+    j += "{\"s\":\"" + jsonEsc(WiFi.SSID(i)) + "\",\"r\":" + String(WiFi.RSSI(i)) +
+         ",\"e\":" + (WiFi.encryptionType(i) != ENC_TYPE_NONE ? "true" : "false") + "}";
+  }
+  j += "]";
+  WiFi.scanDelete();
+  server.send(200, "application/json", j);
+}
+
+void handleKick() {
+  if (!auth()) return;
+  String m = server.arg("mac");
+  if (m.length() == 17) {
+    uint8_t mac[6];
+    for (int i = 0; i < 6; i++) {
+      mac[i] = (uint8_t)strtoul(m.substring(i * 3, i * 3 + 2).c_str(), NULL, 16);
+    }
+    wifi_softap_deauth(mac);
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleSave() {
+  if (!auth()) return;
+  String rs = server.arg("rs");
+  String rp = server.arg("rp");
+  String as = server.arg("as");
+  String ap = server.arg("ap");
+  String ad = server.arg("ad");
+  if (as.length() < 1 || as.length() > 32 || rs.length() > 32 || rp.length() > 64 ||
+      ap.length() > 64 || (ap.length() > 0 && ap.length() < 8) ||
+      ad.length() > 32 || (ad.length() > 0 && ad.length() < 4)) {
+    server.send(400, "text/html",
+      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<body style='font-family:sans-serif;padding:16px'>Galat input. Repeater password 8+ character ka ho (ya khali), panel password 4+ ka. <a href='/'>Wapas</a></body>");
+    return;
+  }
+  memset(cfg.rSsid, 0, sizeof(cfg.rSsid));
+  memset(cfg.rPass, 0, sizeof(cfg.rPass));
+  memset(cfg.aSsid, 0, sizeof(cfg.aSsid));
+  memset(cfg.aPass, 0, sizeof(cfg.aPass));
+  strncpy(cfg.rSsid, rs.c_str(), 32);
+  strncpy(cfg.rPass, rp.c_str(), 64);
+  strncpy(cfg.aSsid, as.c_str(), 32);
+  strncpy(cfg.aPass, ap.c_str(), 64);
+  if (ad.length() > 0) {
+    memset(cfg.admin, 0, sizeof(cfg.admin));
+    strncpy(cfg.admin, ad.c_str(), 32);
+  }
+  saveConfig();
+  server.send(200, "text/html",
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<body style='font-family:sans-serif;padding:16px'>Save ho gaya. Restart ho raha hai, 20 second baad dobara judo.</body>");
+  delay(1500);
+  ESP.restart();
+}
+
+void handleReboot() {
+  if (!auth()) return;
+  server.send(200, "text/html",
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<body style='font-family:sans-serif;padding:16px'>Restart ho raha hai...</body>");
+  delay(1000);
+  ESP.restart();
+}
+
+void handleReset() {
+  if (!auth()) return;
+  cfg.magic = 0;
+  saveConfig();
+  server.send(200, "text/html",
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<body style='font-family:sans-serif;padding:16px'>Factory reset ho gaya. Default WiFi: JAAT_Repeater / 12345678, login admin/admin.</body>");
+  delay(1500);
+  ESP.restart();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
+  loadConfig();
+
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  WiFi.setOutputPower(20.5);
+  WiFi.begin(cfg.rSsid, cfg.rPass);
+
+  Serial.print("Router se connect ho raha hai");
+  uint32_t t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 20000) {
+    delay(250);
+    Serial.print('.');
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    dhcpSoftAP.dhcps_set_dns(0, WiFi.dnsIP(0));
+    dhcpSoftAP.dhcps_set_dns(1, WiFi.dnsIP(1));
+  }
+
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP(cfg.aSsid, strlen(cfg.aPass) >= 8 ? cfg.aPass : nullptr, 1, 0, 8);
+
+  if (WiFi.status() == WL_CONNECTED) enableNapt();
+
+  server.on("/", handleRoot);
+  server.on("/scan.json", handleScan);
+  server.on("/kick", handleKick);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/reboot", handleReboot);
+  server.on("/reset", handleReset);
+  server.begin();
+  Serial.println("Panel: http://10.10.10.1");
+}
+
+void loop() {
+  server.handleClient();
+  bool ok = (WiFi.status() == WL_CONNECTED);
+  digitalWrite(LED_BUILTIN, ok ? LOW : HIGH);  // LED jale = router se juda hai
+  if (ok && !natOn) enableNapt();
+}

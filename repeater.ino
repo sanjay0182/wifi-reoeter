@@ -11,7 +11,6 @@
 #include <user_interface.h>
 #include <lwip/napt.h>
 #include <lwip/dns.h>
-#include <LwipDhcpServer.h>
 
 #define NAPT_ENTRIES 1000
 #define NAPT_PORTS 10
@@ -30,6 +29,8 @@ Config cfg;
 ESP8266WebServer server(80);
 IPAddress apIP(10, 10, 10, 1);
 bool natOn = false;
+extern "C" bool wifi_softap_deauth(uint8_t mac[6]) __attribute__((weak));
+#define wifi_softap_deauth_w wifi_softap_deauth
 
 static const char PAGE_HEAD[] PROGMEM = R"rawliteral(<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>JAAT Repeater</title><style>
 :root{color-scheme:light dark}
@@ -116,8 +117,7 @@ bool auth() {
 }
 
 void enableNapt() {
-  dhcpSoftAP.dhcps_set_dns(0, WiFi.dnsIP(0));
-  dhcpSoftAP.dhcps_set_dns(1, WiFi.dnsIP(1));
+  WiFi.softAPDhcpServer().setDns(WiFi.dnsIP(0));
   err_t ret = ip_napt_init(NAPT_ENTRIES, NAPT_PORTS);
   if (ret == ERR_OK) ret = ip_napt_enable_no(SOFTAP_IF, 1);
   natOn = (ret == ERR_OK);
@@ -208,7 +208,16 @@ void handleKick() {
     for (int i = 0; i < 6; i++) {
       mac[i] = (uint8_t)strtoul(m.substring(i * 3, i * 3 + 2).c_str(), NULL, 16);
     }
-    wifi_softap_deauth(mac);
+    if (wifi_softap_deauth_w) {
+      wifi_softap_deauth_w(mac);
+    } else {
+      // deauth API na mile to AP dobara chalu karo (sab device reconnect honge)
+      WiFi.softAPdisconnect(false);
+      delay(200);
+      WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+      WiFi.softAP(cfg.aSsid, strlen(cfg.aPass) >= 8 ? cfg.aPass : nullptr, 1, 0, 8);
+      WiFi.softAPDhcpServer().setDns(WiFi.dnsIP(0));
+    }
   }
   server.sendHeader("Location", "/");
   server.send(303);
@@ -288,11 +297,6 @@ void setup() {
     Serial.print('.');
   }
   Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    dhcpSoftAP.dhcps_set_dns(0, WiFi.dnsIP(0));
-    dhcpSoftAP.dhcps_set_dns(1, WiFi.dnsIP(1));
-  }
 
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
   WiFi.softAP(cfg.aSsid, strlen(cfg.aPass) >= 8 ? cfg.aPass : nullptr, 1, 0, 8);

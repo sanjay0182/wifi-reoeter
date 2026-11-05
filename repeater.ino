@@ -149,14 +149,15 @@ void enableNapt() {
 
 void measureNet() {
   WiFiClient c;
+  c.setTimeout(1200);   // connect ka timeout (ms)
   uint32_t t = millis();
-  if (c.connect(IPAddress(1, 1, 1, 1), 443, 1200)) {
+  if (c.connect(IPAddress(1, 1, 1, 1), 443)) {
     netLat = (int)(millis() - t);
     c.stop();
     return;
   }
   t = millis();
-  if (c.connect(IPAddress(8, 8, 8, 8), 53, 1200)) {
+  if (c.connect(IPAddress(8, 8, 8, 8), 53)) {
     netLat = (int)(millis() - t);
     c.stop();
     return;

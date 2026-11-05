@@ -3,7 +3,10 @@
 //
 // Repeater ke WiFi se judo -> browser me http://10.10.10.1
 // Login: user "admin", password "admin" (pehle login ke baad badal lena)
-// Panel me: status, judhe devices (disconnect button), router scan, settings, restart, reset.
+// Panel me: status, judhe devices (disconnect button), router scan, settings, proxy (PAC), restart, reset.
+// LED (blue, NodeMCU): router nahi juda = 2 sec me chhota flash | juda par net nahi = LED jalti rahe |
+//   net hai = blink: tez blink = net fast, dheere blink = net slow.
+// Router band/password galat ho to bhi repeater WiFi + panel chalta rahega, aur router ko baar-baar try karta rahega.
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
@@ -15,6 +18,7 @@
 #define NAPT_ENTRIES 1000
 #define NAPT_PORTS 10
 #define CFG_MAGIC 0xA5A50002
+#define CFG_MAGIC2 0x5A5A0001
 
 struct Config {
   uint32_t magic;
@@ -23,12 +27,21 @@ struct Config {
   char aSsid[33];   // repeater ka naam
   char aPass[65];   // repeater ka password (8+ ya khali)
   char admin[33];   // panel ka password
+  // --- neeche wale naye fields (purani settings saaf nahi hoti) ---
+  uint32_t magic2;
+  uint8_t pEn;      // proxy chalu?
+  uint8_t pType;    // 0 = HTTP, 1 = SOCKS5
+  uint16_t pPort;
+  char pHost[65];   // proxy ka host/IP
 };
 
 Config cfg;
 ESP8266WebServer server(80);
 IPAddress apIP(10, 10, 10, 1);
 bool natOn = false;
+bool wasOk = false;
+uint32_t lastRetry = 0, discSince = 0, lastNet = 0;
+int netLat = -2;   // -2 = naap rahe, -1 = internet nahi, >=0 = ms
 extern "C" bool wifi_softap_deauth(uint8_t mac[6]) __attribute__((weak));
 #define wifi_softap_deauth_w wifi_softap_deauth
 
@@ -75,6 +88,12 @@ void loadConfig() {
     strcpy(cfg.aPass, "12345678");
     strcpy(cfg.admin, "admin");
   }
+  if (cfg.magic2 != CFG_MAGIC2) {
+    cfg.magic2 = CFG_MAGIC2;
+    cfg.pEn = 0; cfg.pType = 0; cfg.pPort = 8080;
+    memset(cfg.pHost, 0, sizeof(cfg.pHost));
+  }
+  cfg.pHost[64] = 0;
   cfg.rSsid[32] = 0; cfg.rPass[64] = 0;
   cfg.aSsid[32] = 0; cfg.aPass[64] = 0; cfg.admin[32] = 0;
 }
@@ -117,11 +136,47 @@ bool auth() {
 }
 
 void enableNapt() {
-  WiFi.softAPDhcpServer().setDns(WiFi.dnsIP(0));
-  err_t ret = ip_napt_init(NAPT_ENTRIES, NAPT_PORTS);
-  if (ret == ERR_OK) ret = ip_napt_enable_no(SOFTAP_IF, 1);
-  natOn = (ret == ERR_OK);
-  Serial.println(natOn ? "NAT chalu" : "NAT fail (lwIP variant check karo)");
+  IPAddress d = WiFi.dnsIP(0);
+  if (d == IPAddress(0, 0, 0, 0)) d = IPAddress(8, 8, 8, 8);
+  WiFi.softAPDhcpServer().setDns(d);
+  if (!natOn) {
+    err_t ret = ip_napt_init(NAPT_ENTRIES, NAPT_PORTS);
+    if (ret == ERR_OK) ret = ip_napt_enable_no(SOFTAP_IF, 1);
+    natOn = (ret == ERR_OK);
+    Serial.println(natOn ? "NAT chalu" : "NAT fail (lwIP variant check karo)");
+  }
+}
+
+void measureNet() {
+  WiFiClient c;
+  uint32_t t = millis();
+  if (c.connect(IPAddress(1, 1, 1, 1), 443, 1200)) {
+    netLat = (int)(millis() - t);
+    c.stop();
+    return;
+  }
+  t = millis();
+  if (c.connect(IPAddress(8, 8, 8, 8), 53, 1200)) {
+    netLat = (int)(millis() - t);
+    c.stop();
+    return;
+  }
+  netLat = -1;
+}
+
+void updateLed(bool ok) {
+  uint32_t now = millis();
+  bool on;
+  if (!ok) {
+    on = (now % 2000) < 80;            // router nahi juda: chhota flash
+  } else if (netLat == -1) {
+    on = true;                          // router juda, net nahi: LED jalti rahe
+  } else {
+    uint32_t hp = 500;                  // naap rahe
+    if (netLat >= 0) hp = netLat <= 80 ? 100 : (netLat <= 200 ? 300 : (netLat <= 500 ? 700 : 1300));
+    on = ((now / hp) & 1);
+  }
+  digitalWrite(LED_BUILTIN, on ? LOW : HIGH);
 }
 
 void handleRoot() {
@@ -132,7 +187,15 @@ void handleRoot() {
   server.sendContent_P(PAGE_HEAD);
 
   String h = F("<div class=c><h3>Status</h3><table>");
-  h += row("Router", ok ? "<span class=g>Juda hua</span>" : "<span class=r>Nahi juda</span>");
+  h += row("Router", ok ? "<span class=g>Juda hua</span>" : "<span class=r>Nahi juda (retry chalta rahega)</span>");
+  if (!ok) {
+    int st = WiFi.status();
+    String why = "Dhundh raha hai...";
+    if (st == WL_NO_SSID_AVAIL) why = "Router mila nahi / band hai";
+    else if (st == WL_CONNECT_FAILED || st == WL_WRONG_PASSWORD) why = "Password galat lagta hai";
+    h += row("Wajah", why);
+    h += row("Bina router", String((millis() - discSince) / 60000) + " min");
+  }
   h += row("Router naam", esc(String(cfg.rSsid)));
   if (ok) {
     int r = WiFi.RSSI();
@@ -140,7 +203,11 @@ void handleRoot() {
     h += row("Router se mila IP", WiFi.localIP().toString());
     h += row("Signal", String(r) + " dBm (" + q + ")");
     h += row("Channel", String(WiFi.channel()));
+    if (netLat >= 0) h += row("Internet", "<span class=g>Chal raha, " + String(netLat) + " ms</span>");
+    else if (netLat == -1) h += row("Internet", "<span class=r>Nahi mil raha</span>");
+    else h += row("Internet", "Naap rahe...");
   }
+  h += row("LED", "tez blink = net fast, dheere = slow, jalti rahe = net nahi, chhota flash = router nahi");
   h += row("Repeater WiFi", esc(String(cfg.aSsid)));
   h += row("Repeater IP", apIP.toString());
   h += row("Internet sharing (NAT)", natOn ? "<span class=g>Chalu</span>" : "<span class=r>Band</span>");
@@ -180,6 +247,19 @@ void handleRoot() {
   h += esc(String(cfg.aPass));
   h += F("'><label>Panel ka password (khali = purana)</label><input name=ad value=''>");
   h += F("<button type=submit>Save aur restart</button></form></div>");
+  server.sendContent(h);
+
+  h = F("<div class=c><h3>Proxy (sirf ek device ke liye)</h3><form method=POST action='/saveproxy'>");
+  h += F("<label><input type=checkbox name=pe value=1 style='width:auto' ");
+  if (cfg.pEn) h += F("checked");
+  h += F("> Proxy chalu</label><label>Type</label><select name=pt><option value=0>HTTP</option><option value=1");
+  if (cfg.pType) h += F(" selected");
+  h += F(">SOCKS5</option></select><label>Proxy host / IP</label><input name=ph value='");
+  h += esc(String(cfg.pHost));
+  h += F("'><label>Port</label><input name=pp type=number value='");
+  h += String(cfg.pPort);
+  h += F("'><button type=submit>Proxy save karo</button></form>");
+  h += F("<p style='font-size:13px;opacity:.75'>Us device ki WiFi settings me Proxy = Auto-config (PAC), URL: <b>http://10.10.10.1/proxy.pac</b>. Sirf wahi device proxy se chalega, baaki normal. Proxy band hua to us device ka net band rahega.</p></div>");
   server.sendContent(h);
 
   server.sendContent_P(PAGE_TAIL);
@@ -258,6 +338,48 @@ void handleSave() {
   ESP.restart();
 }
 
+void handlePac() {
+  String p = F("function FindProxyForURL(url,host){\n");
+  p += F("if(isPlainHostName(host)||host=='localhost'||shExpMatch(host,'10.*')||shExpMatch(host,'192.168.*')||shExpMatch(host,'127.*'))return 'DIRECT';\n");
+  if (cfg.pEn && cfg.pHost[0]) {
+    String hp = String(cfg.pHost) + ":" + String(cfg.pPort);
+    if (cfg.pType) p += "return 'SOCKS5 " + hp + "; SOCKS " + hp + "';\n";
+    else p += "return 'PROXY " + hp + "';\n";
+  } else {
+    p += F("return 'DIRECT';\n");
+  }
+  p += "}\n";
+  server.sendHeader("Cache-Control", "no-cache");
+  server.send(200, "application/x-ns-proxy-autoconfig", p);
+}
+
+void handleProxySave() {
+  if (!auth()) return;
+  String h = server.arg("ph");
+  h.trim();
+  int port = server.arg("pp").toInt();
+  bool en = server.hasArg("pe");
+  bool bad = h.length() > 64 || (en && (h.length() < 1 || port < 1 || port > 65535));
+  for (unsigned i = 0; i < h.length() && !bad; i++) {
+    char c = h[i];
+    if (!(isalnum((unsigned char)c) || c == '.' || c == '-' || c == '_' || c == ':')) bad = true;
+  }
+  if (bad) {
+    server.send(400, "text/html",
+      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<body style='font-family:sans-serif;padding:16px'>Proxy host/port galat hai. <a href='/'>Wapas</a></body>");
+    return;
+  }
+  cfg.pEn = en ? 1 : 0;
+  cfg.pType = server.arg("pt").toInt() == 1 ? 1 : 0;
+  cfg.pPort = (port >= 1 && port <= 65535) ? port : 8080;
+  memset(cfg.pHost, 0, sizeof(cfg.pHost));
+  strncpy(cfg.pHost, h.c_str(), 64);
+  saveConfig();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
 void handleReboot() {
   if (!auth()) return;
   server.send(200, "text/html",
@@ -279,6 +401,7 @@ void handleReset() {
 }
 
 void setup() {
+  system_update_cpu_freq(SYS_CPU_160MHZ);   // NAT ke liye tez CPU (80 -> 160 MHz)
   Serial.begin(115200);
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH);
@@ -288,34 +411,60 @@ void setup() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
   WiFi.setOutputPower(20.5);
-  WiFi.begin(cfg.rSsid, cfg.rPass);
+  WiFi.setAutoReconnect(true);
 
-  Serial.print("Router se connect ho raha hai");
-  uint32_t t = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t < 20000) {
-    delay(250);
-    Serial.print('.');
-  }
-  Serial.println();
-
+  // Pehle repeater WiFi + panel chalu (router mile ya na mile, panel hamesha khulega)
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
   WiFi.softAP(cfg.aSsid, strlen(cfg.aPass) >= 8 ? cfg.aPass : nullptr, 1, 0, 8);
-
-  if (WiFi.status() == WL_CONNECTED) enableNapt();
 
   server.on("/", handleRoot);
   server.on("/scan.json", handleScan);
   server.on("/kick", handleKick);
   server.on("/save", HTTP_POST, handleSave);
+  server.on("/saveproxy", HTTP_POST, handleProxySave);
+  server.on("/proxy.pac", handlePac);
   server.on("/reboot", handleReboot);
   server.on("/reset", handleReset);
   server.begin();
   Serial.println("Panel: http://10.10.10.1");
+
+  // Router se connect (background me, setup ko rokta nahi)
+  WiFi.begin(cfg.rSsid, cfg.rPass);
+  lastRetry = millis();
+  discSince = millis();
 }
 
 void loop() {
   server.handleClient();
+  uint32_t now = millis();
   bool ok = (WiFi.status() == WL_CONNECTED);
-  digitalWrite(LED_BUILTIN, ok ? LOW : HIGH);  // LED jale = router se juda hai
-  if (ok && !natOn) enableNapt();
+
+  if (ok) {
+    if (!wasOk) {            // abhi-abhi juda (pehli baar ya router wapas aaya)
+      wasOk = true;
+      netLat = -2;
+      lastNet = 0;
+      enableNapt();
+    }
+    if (now - lastNet > (netLat < 0 ? 8000UL : 15000UL)) {
+      lastNet = now;
+      measureNet();
+    }
+  } else {
+    if (wasOk) {             // abhi-abhi toota
+      wasOk = false;
+      discSince = now;
+      netLat = -1;
+    }
+    // Router na mile / password galat ho to bhi har 45 sec me naya try, hamesha
+    if (now - lastRetry > 45000UL) {
+      lastRetry = now;
+      WiFi.disconnect();
+      WiFi.begin(cfg.rSsid, cfg.rPass);
+    }
+  }
+
+  updateLed(ok);
+  if (ESP.getFreeHeap() < 6000) ESP.restart();   // safety: memory khatam ho to restart
+  yield();
 }

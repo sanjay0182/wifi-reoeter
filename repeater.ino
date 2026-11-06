@@ -7,6 +7,7 @@
 // LED (blue, NodeMCU): router nahi juda = 2 sec me chhota flash | juda par net nahi = LED jalti rahe |
 //   net hai = blink: tez blink = net fast, dheere blink = net slow.
 // Router band/password galat ho to bhi repeater WiFi + panel chalta rahega, aur router ko baar-baar try karta rahega.
+// Transparent mode (Proxy card me checkbox): DNS hijack + tunnel, device me proxy setting nahi; panel tab :8080 par.
 // FLASH button 5 sec dabao = factory reset. Net 5 min tak na mile to router se dobara judta hai.
 
 #include <ESP8266WiFi.h>
@@ -15,6 +16,7 @@
 #include <user_interface.h>
 #include <lwip/napt.h>
 #include <lwip/dns.h>
+#include <DNSServer.h>
 
 // 1 = CPU 160 MHz, 0 = 80 MHz (speed compare karne ke liye badlo)
 #define USE_160MHZ 1
@@ -28,6 +30,7 @@
 #define CFG_MAGIC3 0x5A5A0003
 #define CFG_MAGIC4 0x5A5A0004
 #define CFG_MAGIC5 0x5A5A0005
+#define CFG_MAGIC6 0x5A5A0006
 // Repeater ka default network: 10.10.<ye number>.1  (is board ke liye chaho to 20 kar do)
 #define DEFAULT_AP_OCT 10
 
@@ -50,6 +53,8 @@ struct Config {
   uint8_t apOct;    // repeater network: 10.10.<apOct>.1
   uint32_t magic5;
   char apMac[18];   // repeater (AP) MAC, khali = board ka apna
+  uint32_t magic6;
+  uint8_t tEn;      // transparent proxy (DNS hijack + tunnel) chalu?
 };
 
 Config cfg;
@@ -135,6 +140,11 @@ void loadConfig() {
     cfg.magic5 = CFG_MAGIC5;
     memset(cfg.apMac, 0, sizeof(cfg.apMac));
   }
+  if (cfg.magic6 != CFG_MAGIC6) {
+    cfg.magic6 = CFG_MAGIC6;
+    cfg.tEn = 0;
+  }
+  cfg.tEn = cfg.tEn ? 1 : 0;
   cfg.apMac[17] = 0;
   if (cfg.apOct < 1 || cfg.apOct > 254) cfg.apOct = DEFAULT_AP_OCT;
   cfg.dns[15] = 0;
@@ -185,6 +195,7 @@ void enableNapt() {
   IPAddress custom;
   if (cfg.dns[0] && custom.fromString(cfg.dns)) d = custom;
   if (d == IPAddress(0, 0, 0, 0)) d = IPAddress(8, 8, 8, 8);
+  if (cfg.tEn) d = apIP;   // transparent mode: clients ka DNS = repeater khud
   WiFi.softAPDhcpServer().setDns(d);
   if (!natOn) {
     err_t ret = ip_napt_init(NAPT_ENTRIES, NAPT_PORTS);
@@ -198,6 +209,11 @@ void measureNet() {
   WiFiClient c;
   c.setTimeout(500);   // connect ka timeout (ms)
   uint32_t t = millis();
+  if (cfg.tEn && cfg.pEn && cfg.pHost[0]) {   // proxy se net: proxy tak pahunch = net theek
+    if (c.connect(cfg.pHost, cfg.pPort)) { netLat = (int)(millis() - t); c.stop(); }
+    else netLat = -1;
+    return;
+  }
   if (c.connect(IPAddress(1, 1, 1, 1), 443)) {
     netLat = (int)(millis() - t);
     c.stop();
@@ -226,6 +242,343 @@ void updateLed(bool ok) {
   }
   digitalWrite(LED_BUILTIN, on ? LOW : HIGH);
 }
+
+// ================= Transparent proxy: DNS hijack + tunnel =================
+// 1) DHCP se client ko DNS = repeater milta hai, repeater har naam ka jawab apna IP deta hai.
+// 2) Client repeater ke port 80 (HTTP) ya 443 (HTTPS) par aata hai.
+// 3) Repeater HTTP "Host:" ya HTTPS ClientHello ka SNI padh ke site ka naam nikalta hai.
+// 4) Upar wale proxy ko CONNECT site:port bhejta hai (ya SOCKS5), phir dono taraf ka data pipe karta hai.
+// Limit: sirf port 80/443. ESP8266 me ~5 TCP socket hote hain aur har tunnel 2 leta hai, isliye TUN_MAX 2.
+#define TUN_MAX 2            // ek saath kitne tunnel
+#define TUN_HEAD 2048        // shuru ke bytes (ClientHello / HTTP head) rakhne ki jagah
+#define TUN_HEAD_MS 4000UL   // itni der me client ne kuch na bheja to band
+#define TUN_IDLE_MS 60000UL  // tunnel me itni der kuch na chale to band
+#define PANEL_ALT_PORT 8080  // transparent mode me panel yaha khulta hai (port 80 tunnel ke liye chahiye)
+
+// ==== PURE-START (sirf bytes parse karne wale functions, koi ESP cheez nahi)
+static bool okHostName(const char *h) {
+  if (!h[0]) return false;
+  for (const char *p = h; *p; p++) {
+    char c = *p;
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_')) return false;
+  }
+  return true;
+}
+
+// TLS ClientHello se SNI (site ka naam) nikalo. Mila to length, nahi mila to 0.
+static int parseSNI(const uint8_t *b, int n, char *out, int cap) {
+  if (n < 9 || b[0] != 0x16 || b[5] != 0x01) return 0;   // handshake record + ClientHello
+  int p = 5 + 4 + 2 + 32;                                // record(5) + hs header(4) + version(2) + random(32)
+  if (p + 1 > n) return 0;
+  p += 1 + b[p];                                         // session id
+  if (p + 2 > n) return 0;
+  p += 2 + ((b[p] << 8) | b[p + 1]);                     // cipher suites
+  if (p + 1 > n) return 0;
+  p += 1 + b[p];                                         // compression
+  if (p + 2 > n) return 0;
+  int extEnd = p + 2 + ((b[p] << 8) | b[p + 1]);
+  p += 2;
+  if (extEnd > n) extEnd = n;                            // adhura aaya ho to jitna hai utna dekho
+  while (p + 4 <= extEnd) {
+    int type = (b[p] << 8) | b[p + 1];
+    int len = (b[p + 2] << 8) | b[p + 3];
+    p += 4;
+    if (type == 0) {                                     // server_name extension
+      if (p + 5 > n || b[p + 2] != 0) return 0;          // list len(2), name type(1)=host_name
+      int nl = (b[p + 3] << 8) | b[p + 4];
+      if (nl <= 0 || nl >= cap || p + 5 + nl > n) return 0;
+      memcpy(out, b + p + 5, nl);
+      out[nl] = 0;
+      return nl;
+    }
+    p += len;
+  }
+  return 0;
+}
+
+// HTTP request ke head se "Host:" nikalo (port hata ke). Mila to length, nahi mila to 0.
+static int parseHttpHost(const uint8_t *b, int n, char *out, int cap) {
+  int i = 0;
+  while (i < n && b[i] != '\n') i++;   // request line chhodo
+  i++;
+  while (i < n) {
+    int ls = i;
+    while (i < n && b[i] != '\n') i++;
+    int le = i;
+    if (le > ls && b[le - 1] == '\r') le--;
+    if (le == ls) break;               // khali line = headers khatam
+    if (le - ls > 5 && strncasecmp((const char *)b + ls, "host:", 5) == 0) {
+      int s = ls + 5;
+      while (s < le && (b[s] == ' ' || b[s] == '\t')) s++;
+      int e = s;
+      while (e < le && b[e] != ':') e++;
+      int nl = e - s;
+      if (nl <= 0 || nl >= cap) return 0;
+      memcpy(out, b + s, nl);
+      out[nl] = 0;
+      return nl;
+    }
+    i++;
+  }
+  return 0;
+}
+
+// HTTP head poora aaya? (\r\n\r\n mila)
+static bool httpHeadDone(const uint8_t *b, int n) {
+  for (int i = 3; i < n; i++)
+    if (b[i] == '\n' && b[i - 1] == '\r' && b[i - 2] == '\n' && b[i - 3] == '\r') return true;
+  return false;
+}
+
+// request line se path nikalo (redirect ke liye)
+static void parseReqPath(const uint8_t *b, int n, char *out, int cap) {
+  int i = 0, o = 0;
+  while (i < n && b[i] != ' ' && b[i] != '\r' && b[i] != '\n') i++;
+  if (i < n && b[i] == ' ') i++;
+  while (i < n && b[i] > ' ' && b[i] < 0x7F && o < cap - 1) out[o++] = (char)b[i++];
+  out[o] = 0;
+  if (o == 0 || out[0] != '/') { out[0] = '/'; out[1] = 0; }
+}
+// ==== PURE-END
+
+struct Tun {
+  bool used, relay;
+  uint16_t port, hl;
+  uint8_t *head;
+  uint32_t t0, last;
+  WiFiClient c, u;   // c = client (repeater se juda), u = upstream (proxy ki taraf)
+};
+static Tun tun[TUN_MAX];
+static WiFiServer tsrv80(80), tsrv443(443);
+static DNSServer dnsSrv;
+static uint8_t rbuf[1460];
+static uint32_t proxyBadAt = 0, tunOk = 0, tunFail = 0;
+static char tunErr[56] = "-";
+
+static inline bool older(uint32_t now, uint32_t t, uint32_t ms) {
+  return (int32_t)(now - t) > (int32_t)ms;
+}
+
+static void tunClose(Tun &t) {
+  t.c.stop();
+  t.u.stop();
+  if (t.head) { free(t.head); t.head = NULL; }
+  t.used = false;
+  t.relay = false;
+  t.hl = 0;
+}
+
+static void tunReply(WiFiClient &c, const char *code, const char *msg) {
+  c.print("HTTP/1.1 ");
+  c.print(code);
+  c.print("\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: ");
+  c.print((int)strlen(msg));
+  c.print("\r\n\r\n");
+  c.print(msg);
+}
+
+static bool readN(WiFiClient &u, uint8_t *b, int n, uint32_t ms) {
+  uint32_t t0 = millis();
+  int got = 0;
+  while (got < n) {
+    int a = u.available();
+    if (a > 0) {
+      int r = u.read(b + got, (a < n - got) ? a : (n - got));
+      if (r > 0) got += r;
+      continue;
+    }
+    if (!u.connected() || (millis() - t0) > ms) return false;
+    delay(1);
+  }
+  return true;
+}
+
+// Proxy se juro aur "host:port" tak ka rasta kholo. Sahi hua to true.
+static bool openUpstream(WiFiClient &u, const char *host, uint16_t port) {
+  if (!cfg.pEn || !cfg.pHost[0]) { strcpy(tunErr, "proxy set nahi (Proxy chalu + host/port bharo)"); return false; }
+  u.setTimeout(1500);
+  if (!u.connect(cfg.pHost, cfg.pPort)) { strcpy(tunErr, "proxy se connect nahi hua (host/port ya router check karo)"); return false; }
+  u.setNoDelay(true);
+  if (cfg.pType == 0) {
+    // HTTP proxy: CONNECT host:port
+    char req[220];
+    int n = snprintf(req, sizeof(req), "CONNECT %s:%u HTTP/1.1\r\nHost: %s:%u\r\nProxy-Connection: keep-alive\r\n\r\n", host, port, host, port);
+    u.write((const uint8_t *)req, n);
+    char line[16] = {0};
+    int ln = 0;
+    uint32_t tail = 0, t0 = millis();
+    while ((millis() - t0) < 2500) {
+      while (u.available()) {
+        int ch = u.read();
+        if (ln < (int)sizeof(line) - 1) line[ln++] = (char)ch;
+        tail = (tail << 8) | (uint8_t)ch;
+        if (tail == 0x0D0A0D0AUL) {
+          if (strstr(line, " 200")) return true;
+          snprintf(tunErr, sizeof(tunErr), "proxy ne CONNECT mana kiya (%.3s) port %u", line + 9, port);
+          return false;
+        }
+      }
+      if (!u.connected() && !u.available()) { strcpy(tunErr, "proxy ne connection tod diya"); return false; }
+      delay(1);
+    }
+    strcpy(tunErr, "proxy ne jawab nahi diya (CONNECT)");
+    return false;
+  }
+  // SOCKS5 (bina password)
+  uint8_t g[3] = {5, 1, 0};
+  u.write(g, 3);
+  uint8_t r[4];
+  if (!readN(u, r, 2, 2000) || r[0] != 5 || r[1] != 0) { strcpy(tunErr, "SOCKS5 handshake fail"); return false; }
+  int hl = strlen(host);
+  uint8_t q[5 + 96 + 2];
+  q[0] = 5; q[1] = 1; q[2] = 0; q[3] = 3; q[4] = (uint8_t)hl;
+  memcpy(q + 5, host, hl);
+  q[5 + hl] = (uint8_t)(port >> 8);
+  q[6 + hl] = (uint8_t)(port & 255);
+  u.write(q, 7 + hl);
+  if (!readN(u, r, 4, 2500) || r[0] != 5 || r[1] != 0) { strcpy(tunErr, "SOCKS5 ne connect mana kiya"); return false; }
+  int skip = 0;
+  if (r[3] == 1) skip = 6;
+  else if (r[3] == 4) skip = 18;
+  else if (r[3] == 3) {
+    uint8_t l;
+    if (!readN(u, &l, 1, 2000)) { strcpy(tunErr, "SOCKS5 jawab adhura"); return false; }
+    skip = l + 2;
+  }
+  uint8_t d;
+  while (skip-- > 0) {
+    if (!readN(u, &d, 1, 2000)) { strcpy(tunErr, "SOCKS5 jawab adhura"); return false; }
+  }
+  return true;
+}
+
+static void tunAccept(WiFiServer &s, uint16_t port, uint32_t now) {
+  for (int i = 0; i < TUN_MAX; i++) {
+    if (tun[i].used) continue;
+    WiFiClient c = s.available();
+    if (!c) return;
+    uint8_t *h = (uint8_t *)malloc(TUN_HEAD);
+    if (!h) { c.stop(); return; }
+    Tun &t = tun[i];
+    t.c = c;
+    t.c.setNoDelay(true);
+    t.head = h;
+    t.hl = 0;
+    t.port = port;
+    t.used = true;
+    t.relay = false;
+    t.t0 = now;
+    t.last = now;
+    return;   // ek baar me ek hi naya connection
+  }
+}
+
+static void tunStep(Tun &t, uint32_t now) {
+  if (!t.relay) {
+    // ---- pehle client ke shuru ke bytes padho ----
+    int a = t.c.available();
+    if (a > 0) {
+      if (a > TUN_HEAD - t.hl) a = TUN_HEAD - t.hl;
+      if (a > 0) {
+        int r = t.c.read(t.head + t.hl, a);
+        if (r > 0) { t.hl += r; t.last = now; }
+      }
+    }
+    bool ready;
+    if (t.port == 443) {
+      ready = false;
+      if (t.hl >= 5) {
+        uint32_t need = 5 + (((uint32_t)t.head[3] << 8) | t.head[4]);
+        ready = (t.hl >= need) || (t.hl >= TUN_HEAD) || older(now, t.last, 800);
+      }
+    } else {
+      ready = httpHeadDone(t.head, t.hl) || t.hl >= TUN_HEAD;
+    }
+    if (!ready) {
+      if (older(now, t.t0, TUN_HEAD_MS) || (!t.c.connected() && t.c.available() == 0)) tunClose(t);
+      return;
+    }
+
+    char host[96];
+    host[0] = 0;
+    if (t.port == 443) parseSNI(t.head, t.hl, host, sizeof(host));
+    else parseHttpHost(t.head, t.hl, host, sizeof(host));
+
+    // port 80 par repeater ka apna IP likha ho (ya Host na ho) = panel kholna hai -> :8080 par bhejo
+    if (t.port == 80 && (host[0] == 0 || apIP.toString() == host)) {
+      char path[80];
+      parseReqPath(t.head, t.hl, path, sizeof(path));
+      t.c.print("HTTP/1.1 302 Found\r\nLocation: http://" + apIP.toString() + ":" + String(PANEL_ALT_PORT) + path +
+                "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+      tunClose(t);
+      return;
+    }
+    if (!okHostName(host)) {
+      strcpy(tunErr, t.port == 443 ? "HTTPS: site ka naam (SNI) nahi mila" : "HTTP: Host nahi mila");
+      tunFail++;
+      tunClose(t);
+      return;
+    }
+    if (proxyBadAt && !older(millis(), proxyBadAt, 3000)) {   // proxy abhi atka tha: 3 sec ruko
+      tunFail++;
+      if (t.port == 80) tunReply(t.c, "502 Bad Gateway", "Proxy se connect nahi hua");
+      tunClose(t);
+      return;
+    }
+    if (!openUpstream(t.u, host, t.port)) {
+      proxyBadAt = millis();
+      if (!proxyBadAt) proxyBadAt = 1;
+      tunFail++;
+      if (t.port == 80) tunReply(t.c, "502 Bad Gateway", "Proxy se connect nahi hua");
+      tunClose(t);
+      return;
+    }
+    proxyBadAt = 0;
+    t.u.write(t.head, t.hl);        // shuru ke bytes proxy ko aage bhejo
+    free(t.head);
+    t.head = NULL;
+    t.hl = 0;
+    t.relay = true;
+    t.last = millis();
+    tunOk++;
+    return;
+  }
+
+  // ---- tunnel chalu: data idhar se udhar ----
+  int a = t.c.available();
+  if (a > 0) {
+    int w = t.u.availableForWrite();
+    if (w > 0) {
+      if (a > w) a = w;
+      if (a > (int)sizeof(rbuf)) a = sizeof(rbuf);
+      int r = t.c.read(rbuf, a);
+      if (r > 0) { t.u.write(rbuf, r); t.last = now; }
+    }
+  }
+  a = t.u.available();
+  if (a > 0) {
+    int w = t.c.availableForWrite();
+    if (w > 0) {
+      if (a > w) a = w;
+      if (a > (int)sizeof(rbuf)) a = sizeof(rbuf);
+      int r = t.u.read(rbuf, a);
+      if (r > 0) { t.c.write(rbuf, r); t.last = now; }
+    }
+  }
+  bool cc = t.c.connected() || t.c.available();
+  bool uc = t.u.connected() || t.u.available();
+  if (!cc || !uc || older(now, t.last, TUN_IDLE_MS)) tunClose(t);
+}
+
+static void tunnelLoop() {
+  uint32_t now = millis();
+  dnsSrv.processNextRequest();
+  tunAccept(tsrv80, 80, now);
+  tunAccept(tsrv443, 443, now);
+  for (int i = 0; i < TUN_MAX; i++)
+    if (tun[i].used) tunStep(tun[i], now);
+}
+// ================= Transparent proxy khatam =================
 
 void handleRoot() {
   if (!auth()) return;
@@ -260,6 +613,11 @@ void handleRoot() {
   h += row("Repeater IP", apIP.toString());
   h += row("Repeater MAC", WiFi.softAPmacAddress());
   h += row("Internet sharing (NAT)", natOn ? "<span class=g>Chalu</span>" : "<span class=r>Band</span>");
+  if (cfg.tEn) {
+    h += row("Transparent proxy", "<span class=g>Chalu</span> (panel port " + String(PANEL_ALT_PORT) + ")");
+    h += row("Tunnel", "ok " + String(tunOk) + " / fail " + String(tunFail));
+    h += row("Tunnel error", esc(String(tunErr)));
+  }
   h += row("Uptime", uptimeStr());
   h += row("Free RAM", String(ESP.getFreeHeap() / 1024) + " KB");
   h += F("</table></div>");
@@ -304,7 +662,7 @@ void handleRoot() {
   h += F("<button type=submit>Save aur restart</button></form></div>");
   server.sendContent(h);
 
-  h = F("<div class=c><h3>Proxy (sirf ek device ke liye)</h3><form method=POST action='/saveproxy'>");
+  h = F("<div class=c><h3>Proxy</h3><form method=POST action='/saveproxy'>");
   h += F("<label><input type=checkbox name=pe value=1 style='width:auto' ");
   if (cfg.pEn) h += F("checked");
   h += F("> Proxy chalu</label><label>Type</label><select name=pt><option value=0>HTTP</option><option value=1");
@@ -313,8 +671,12 @@ void handleRoot() {
   h += esc(String(cfg.pHost));
   h += F("'><label>Port</label><input name=pp type=number value='");
   h += String(cfg.pPort);
-  h += F("'><button type=submit>Proxy save karo</button></form>");
-  h += F("<p style='font-size:13px;opacity:.75'>Us device ki WiFi settings me Proxy = Auto-config (PAC), URL: <b>http://10.10.10.1/proxy.pac</b>. Sirf wahi device proxy se chalega, baaki normal. Proxy band hua to us device ka net band rahega.</p></div>");
+  h += F("'><label><input type=checkbox name=te value=1 style='width:auto' ");
+  if (cfg.tEn) h += F("checked");
+  h += F("> Transparent mode (device me koi proxy setting nahi)</label>");
+  h += F("<button type=submit>Proxy save karo</button></form>");
+
+  h += F("<p style='font-size:13px;opacity:.75'>Transparent mode: sab devices bina setting ke chalenge (sirf port 80/443). Chalu/band karne par restart hoga, aur panel <b>http://10.10.10.1:8080</b> par khulega. Band rakho to purana tareeka: device me PAC URL <b>http://10.10.10.1/proxy.pac</b>.</p></div>");
   server.sendContent(h);
 
   server.sendContent_P(PAGE_TAIL);
@@ -351,7 +713,7 @@ void handleKick() {
       delay(200);
       WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
       WiFi.softAP(cfg.aSsid, strlen(cfg.aPass) >= 8 ? cfg.aPass : nullptr, 1, 0, 8);
-      WiFi.softAPDhcpServer().setDns(WiFi.dnsIP(0));
+      WiFi.softAPDhcpServer().setDns(cfg.tEn ? apIP : WiFi.dnsIP(0));
     }
   }
   server.sendHeader("Location", "/");
@@ -428,6 +790,7 @@ void handleProxySave() {
   h.trim();
   int port = server.arg("pp").toInt();
   bool en = server.hasArg("pe");
+  bool te = server.hasArg("te");
   bool bad = h.length() > 64 || (en && (h.length() < 1 || port < 1 || port > 65535));
   for (unsigned i = 0; i < h.length() && !bad; i++) {
     char c = h[i];
@@ -444,7 +807,18 @@ void handleProxySave() {
   cfg.pPort = (port >= 1 && port <= 65535) ? port : 8080;
   memset(cfg.pHost, 0, sizeof(cfg.pHost));
   strncpy(cfg.pHost, h.c_str(), 64);
+  bool tchg = (te ? 1 : 0) != cfg.tEn;
+  cfg.tEn = te ? 1 : 0;
   saveConfig();
+  if (tchg) {
+    String u = "http://" + apIP.toString() + (te ? ":" + String(PANEL_ALT_PORT) : String(""));
+    server.send(200, "text/html",
+      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<body style='font-family:sans-serif;padding:16px'>Save ho gaya. Restart ho raha hai, 20 second baad dobara judo. Panel ab " + u + " par khulega.</body>");
+    delay(1500);
+    ESP.restart();
+    return;
+  }
   server.sendHeader("Location", "/");
   server.send(303);
 }
@@ -504,8 +878,16 @@ void setup() {
   server.on("/proxy.pac", handlePac);
   server.on("/reboot", handleReboot);
   server.on("/reset", handleReset);
-  server.begin();
-  Serial.println("Panel: http://10.10.10.1");
+  if (cfg.tEn) {
+    WiFi.softAPDhcpServer().setDns(apIP);
+    dnsSrv.start(53, "*", apIP);   // har naam ka jawab = repeater ka IP
+    tsrv80.begin();
+    tsrv80.setNoDelay(true);
+    tsrv443.begin();
+    tsrv443.setNoDelay(true);
+  }
+  server.begin(cfg.tEn ? PANEL_ALT_PORT : 80);
+  Serial.println(cfg.tEn ? "Panel: http://10.10.10.1:8080 (transparent mode)" : "Panel: http://10.10.10.1");
 
   // Router se connect (background me, setup ko rokta nahi)
   WiFi.begin(cfg.rSsid, cfg.rPass);
@@ -515,6 +897,7 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  if (cfg.tEn) tunnelLoop();
   uint32_t now = millis();
   bool ok = (WiFi.status() == WL_CONNECTED);
 

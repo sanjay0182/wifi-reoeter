@@ -18,6 +18,8 @@
 #include <lwip/dns.h>
 #include <DNSServer.h>
 
+struct Tun;   // forward declaration: Arduino auto-prototype ke liye zaroori
+
 // 1 = CPU 160 MHz, 0 = 80 MHz (speed compare karne ke liye badlo)
 #define USE_160MHZ 1
 // --- Speed switches (max speed test ke liye 0 karke dekho) ---

@@ -27,6 +27,7 @@
 #define CFG_MAGIC2 0x5A5A0001
 #define CFG_MAGIC3 0x5A5A0003
 #define CFG_MAGIC4 0x5A5A0004
+#define CFG_MAGIC5 0x5A5A0005
 // Repeater ka default network: 10.10.<ye number>.1  (is board ke liye chaho to 20 kar do)
 #define DEFAULT_AP_OCT 10
 
@@ -47,6 +48,8 @@ struct Config {
   char dns[16];     // custom DNS (khali = router wala)
   uint32_t magic4;
   uint8_t apOct;    // repeater network: 10.10.<apOct>.1
+  uint32_t magic5;
+  char apMac[18];   // repeater (AP) MAC, khali = board ka apna
 };
 
 Config cfg;
@@ -91,6 +94,18 @@ b.textContent='Dobara scan karo';
 }
 </script></body></html>)rawliteral";
 
+bool parseMac(const char *t, uint8_t *m) {
+  if (strlen(t) != 17) return false;
+  for (int i = 0; i < 6; i++) {
+    char a = t[i * 3], b = t[i * 3 + 1];
+    if (!isxdigit((unsigned char)a) || !isxdigit((unsigned char)b)) return false;
+    if (i < 5 && t[i * 3 + 2] != ':') return false;
+    char h[3] = {a, b, 0};
+    m[i] = (uint8_t)strtoul(h, NULL, 16);
+  }
+  return true;
+}
+
 void loadConfig() {
   EEPROM.begin(sizeof(Config));
   EEPROM.get(0, cfg);
@@ -116,6 +131,11 @@ void loadConfig() {
     cfg.magic4 = CFG_MAGIC4;
     cfg.apOct = DEFAULT_AP_OCT;
   }
+  if (cfg.magic5 != CFG_MAGIC5) {
+    cfg.magic5 = CFG_MAGIC5;
+    memset(cfg.apMac, 0, sizeof(cfg.apMac));
+  }
+  cfg.apMac[17] = 0;
   if (cfg.apOct < 1 || cfg.apOct > 254) cfg.apOct = DEFAULT_AP_OCT;
   cfg.dns[15] = 0;
   cfg.pHost[64] = 0;
@@ -238,6 +258,7 @@ void handleRoot() {
   h += row("LED", "tez blink = net fast, dheere = slow, jalti rahe = net nahi, chhota flash = router nahi");
   h += row("Repeater WiFi", esc(String(cfg.aSsid)));
   h += row("Repeater IP", apIP.toString());
+  h += row("Repeater MAC", WiFi.softAPmacAddress());
   h += row("Internet sharing (NAT)", natOn ? "<span class=g>Chalu</span>" : "<span class=r>Band</span>");
   h += row("Uptime", uptimeStr());
   h += row("Free RAM", String(ESP.getFreeHeap() / 1024) + " KB");
@@ -277,6 +298,8 @@ void handleRoot() {
   h += esc(String(cfg.dns));
   h += F("'><label>Repeater network number (10.10.__.1). Repeater ko repeater se jodo to alag rakho</label><input name=an type=number min=1 max=254 value='");
   h += String(cfg.apOct);
+  h += F("'><label>Repeater MAC (khali = board ka apna, jaise 02:11:22:33:44:55)</label><input name=am value='");
+  h += esc(String(cfg.apMac));
   h += F("'><label>Panel ka password (khali = purana)</label><input name=ad value=''>");
   h += F("<button type=submit>Save aur restart</button></form></div>");
   server.sendContent(h);
@@ -344,15 +367,19 @@ void handleSave() {
   String ad = server.arg("ad");
   int an = server.arg("an").toInt();
   String dn = server.arg("dn");
+  String am = server.arg("am");
+  am.trim();
+  uint8_t amt[6];
+  bool macBad = am.length() > 0 && (!parseMac(am.c_str(), amt) || (amt[0] & 1));
   dn.trim();
   IPAddress dtest;
   bool dnsBad = dn.length() > 0 && (dn.length() > 15 || !dtest.fromString(dn));
   if (as.length() < 1 || as.length() > 32 || rs.length() > 32 || rp.length() > 64 ||
       ap.length() > 64 || (ap.length() > 0 && ap.length() < 8) ||
-      ad.length() > 32 || (ad.length() > 0 && ad.length() < 4) || dnsBad || an < 1 || an > 254) {
+      ad.length() > 32 || (ad.length() > 0 && ad.length() < 4) || dnsBad || macBad || an < 1 || an > 254) {
     server.send(400, "text/html",
       "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-      "<body style='font-family:sans-serif;padding:16px'>Galat input. Repeater password 8+ character ka ho (ya khali), panel password 4+ ka, DNS sahi IP ho (jaise 8.8.8.8). <a href='/'>Wapas</a></body>");
+      "<body style='font-family:sans-serif;padding:16px'>Galat input. Repeater password 8+ character ka ho (ya khali), panel password 4+ ka, DNS sahi IP ho (jaise 8.8.8.8), MAC aisa ho 02:11:22:33:44:55. <a href='/'>Wapas</a></body>");
     return;
   }
   memset(cfg.rSsid, 0, sizeof(cfg.rSsid));
@@ -366,6 +393,8 @@ void handleSave() {
   memset(cfg.dns, 0, sizeof(cfg.dns));
   strncpy(cfg.dns, dn.c_str(), 15);
   cfg.apOct = (uint8_t)an;
+  memset(cfg.apMac, 0, sizeof(cfg.apMac));
+  strncpy(cfg.apMac, am.c_str(), 17);
   if (ad.length() > 0) {
     memset(cfg.admin, 0, sizeof(cfg.admin));
     strncpy(cfg.admin, ad.c_str(), 32);
@@ -451,6 +480,10 @@ void setup() {
 
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP_STA);
+  {
+    uint8_t am[6];
+    if (cfg.apMac[0] && parseMac(cfg.apMac, am) && !(am[0] & 1)) wifi_set_macaddr(SOFTAP_IF, am);
+  }
   WiFi.setPhyMode(WIFI_PHY_MODE_11N);   // mode n (martin-ger repeater ka default) = sabse tez
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
   WiFi.setOutputPower(20.5);

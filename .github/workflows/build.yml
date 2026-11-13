@@ -28,7 +28,7 @@ jobs:
       - name: Compile
         run: |
           mkdir -p repeater
-          cp repeater.ino repeater/repeater.ino
+          cp repeater.ino dhcpdns.h repeater/
           arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2:ip=hb2f --output-dir out repeater
 
       - uses: actions/upload-artifact@v4

@@ -10,6 +10,8 @@
 // Transparent mode (Proxy card me checkbox): DNS hijack + tunnel, device me proxy setting nahi; panel tab :8080 par.
 // DNS card: custom DNS (IP ya hostname) ON/OFF, bina restart. Hostname ho to repeater khud IP nikalta hai, aur test karta hai;
 //   DNS jawab na de to router wala DNS hi chalta rahe (client ka net na ruke).
+// DNS 1 (primary) + DNS 2 (secondary): dono me IP ya hostname chalta hai (AdGuard: 94.140.14.14 / dns.adguard-dns.com).
+// DNS lock: device apna alag DNS (port 53 / DoT 853 / DoH ke public IP) use kare to repeater packet rok deta hai.
 // FLASH button 5 sec dabao = factory reset. Net 5 min tak na mile to router se dobara judta hai.
 
 #include <ESP8266WiFi.h>
@@ -18,6 +20,7 @@
 #include <user_interface.h>
 #include <lwip/napt.h>
 #include <lwip/dns.h>
+#include <lwip/netif.h>
 #include <DNSServer.h>
 #include <WiFiUdp.h>
 #include <WiFiClientSecureBearSSL.h>
@@ -39,6 +42,7 @@ struct Tun;   // forward declaration: Arduino auto-prototype ke liye zaroori
 #define CFG_MAGIC6 0x5A5A0006
 #define CFG_MAGIC7 0x5A5A0007
 #define CFG_MAGIC8 0x5A5A0008
+#define CFG_MAGIC9 0x5A5A0009
 // Repeater ka default network: 10.10.<ye number>.1  (is board ke liye chaho to 20 kar do)
 #define DEFAULT_AP_OCT 10
 
@@ -67,7 +71,10 @@ struct Config {
   uint8_t dEn;      // custom DNS chalu? (1 = haan, 0 = router wala DNS)
   char dnsName[64]; // custom DNS: IP ya hostname (jaise 8.8.8.8 / f8cefc.dns.nextdns.io)
   uint32_t magic8;
-  char linkUrl[96]; // NextDNS link-ip URL (https://link-ip.nextdns.io/ID/TOKEN), khali = band. Secret hai.
+  char linkUrl[96]; // NextDNS / AdGuard link-ip URL (https://...), khali = band. Secret hai.
+  uint32_t magic9;
+  char dnsName2[64]; // DNS 2 (secondary): IP ya hostname, khali ho sakta hai
+  uint8_t dLock;    // 1 = device ko alag DNS (bypass) use karne se roko
 };
 
 Config cfg;
@@ -79,12 +86,16 @@ uint32_t lastTick = 0;
 uint32_t lastRetry = 0, discSince = 0, lastNet = 0, badSince = 0, btnSince = 0;
 int netLat = -2;   // -2 = naap rahe, -1 = internet nahi, >=0 = ms
 IPAddress dnsUsed(0, 0, 0, 0);   // clients ko abhi jo DNS mil raha hai
-uint8_t dnsState = 0;            // 0 = custom band/abhi nahi laga, 1 = custom chalu, 2 = naam resolve nahi hua, 3 = DNS ne jawab nahi diya
+uint8_t dnsState = 0;            // 0 = custom band/abhi nahi laga, 1 = custom chalu, 2 = naam resolve nahi hua
 uint32_t lastDnsTry = 0;
 uint32_t lastLink = 0;            // link call ka waqt (0 = abhi karna hai)
 int linkCode = 0;                // 200 = link ho gaya, 0 = abhi call nahi hua / fail
 char linkMsg[64] = "";           // link call ka natija (token kabhi nahi likhta)
-int dnsRc = -1;                  // DNS test ka natija: -1 = koi jawab nahi, 0 = theek, 5 = REFUSED (mana kiya) etc.
+IPAddress dnsUsed2(0, 0, 0, 0);  // clients ko abhi jo secondary DNS mil raha hai
+static volatile uint32_t allowDns[2] = {0, 0};   // DNS lock: jin IP par port 53 jaane dena hai
+IPAddress dhA(0, 0, 0, 0), dhB(0, 0, 0, 0);     // DHCP se clients ko jo DNS jata hai
+static IPAddress pxUp[2];                        // DNS proxy ke upstream (AdGuard 1 / 2)
+static uint32_t lockDrops = 0;                   // DNS lock ne ab tak kitne packet roke
 extern "C" bool wifi_softap_deauth(uint8_t mac[6]) __attribute__((weak));
 #define wifi_softap_deauth_w wifi_softap_deauth
 
@@ -174,6 +185,13 @@ void loadConfig() {
     cfg.magic8 = CFG_MAGIC8;
     memset(cfg.linkUrl, 0, sizeof(cfg.linkUrl));
   }
+  if (cfg.magic9 != CFG_MAGIC9) {
+    cfg.magic9 = CFG_MAGIC9;
+    memset(cfg.dnsName2, 0, sizeof(cfg.dnsName2));
+    cfg.dLock = 1;   // default chalu (sirf tab asar jab Custom DNS chalu ho)
+  }
+  cfg.dnsName2[63] = 0;
+  cfg.dLock = cfg.dLock ? 1 : 0;
   cfg.linkUrl[95] = 0;
   cfg.dEn = cfg.dEn ? 1 : 0;
   cfg.dnsName[63] = 0;
@@ -223,49 +241,107 @@ bool auth() {
   return true;
 }
 
-// Ek chhota DNS sawal (google.com) bhej ke dekho. 3 baar try (pehla packet router judte hi kho sakta hai).
-// Return: -1 = koi jawab nahi, warna DNS ka error code (0 = theek, 5 = REFUSED = server ne mana kiya).
-static int dnsProbe(IPAddress ip) {
-  WiFiUDP u;
-  if (!u.begin(40000 + (millis() & 0x3FFF))) return -1;
-  const uint8_t q[] = {0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0,
-                       6, 'g', 'o', 'o', 'g', 'l', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1};
-  for (int tr = 0; tr < 3; tr++) {
-    u.beginPacket(ip, 53);
-    u.write(q, sizeof(q));
-    u.endPacket();
-    uint32_t t0 = millis();
-    while ((millis() - t0) < 1200) {
-      int n = u.parsePacket();
-      if (n >= 12) {
-        uint8_t r[12];
-        u.read(r, 12);
-        if (r[0] == 0x12 && r[1] == 0x34) { u.stop(); return r[3] & 0x0F; }
+// ===== DNS lock: device apna alag DNS (bypass) use na kar sake =====
+// Port 53 (UDP/TCP) aur DoT (853): sirf wahi DNS jaane do jo DHCP se diya. Baaki packet drop. (443 par koi check nahi = speed par asar nahi)
+
+static netif_input_fn origApInput = NULL;
+
+// Repeater WiFi (AP) par aane wale har packet se pehle chalta hai. Ethernet frame: 14 byte header + IPv4.
+// Kuch bhi samajh na aaye to packet seedha aage jaata hai (kuch bigadta nahi).
+static err_t apInputHook(struct pbuf *p, struct netif *inp) {
+  if (cfg.dLock && cfg.dEn && p && p->len >= 14 + 20 + 4) {
+    const uint8_t *d = (const uint8_t *)p->payload;
+    if (d[12] == 0x08 && d[13] == 0x00 && (d[14] >> 4) == 4) {
+      int ihl = (d[14] & 0x0F) * 4;
+      uint8_t pr = d[23];
+      bool firstFrag = ((((d[20] & 0x1F) << 8) | d[21]) == 0);
+      if (ihl >= 20 && (pr == 6 || pr == 17) && firstFrag && p->len >= 14 + ihl + 4) {
+        uint32_t dst = (uint32_t)d[30] | ((uint32_t)d[31] << 8) | ((uint32_t)d[32] << 16) | ((uint32_t)d[33] << 24);
+        uint16_t dp = ((uint16_t)d[14 + ihl + 2] << 8) | d[14 + ihl + 3];
+        bool drop = false;
+        if (dp == 53) drop = !(dst == (uint32_t)apIP || dst == allowDns[0] || dst == allowDns[1]);
+        else if (dp == 853) drop = true;   // DoT / DoQ
+        if (drop) {
+          lockDrops++;
+          pbuf_free(p);
+          return ERR_OK;
+        }
       }
-      delay(5);
     }
   }
-  u.stop();
-  return -1;
+  return origApInput ? origApInput(p, inp) : ERR_OK;
+}
+
+// AP netif dhundo aur hook lagao (AP restart ho to dobara lagta hai)
+static void lockHookCheck() {
+  uint32_t ap = (uint32_t)apIP;
+  for (struct netif *n = netif_list; n; n = n->next) {
+    if (ip4_addr_get_u32(netif_ip4_addr(n)) != ap) continue;
+    if (n->input != apInputHook) {
+      origApInput = n->input;
+      n->input = apInputHook;
+    }
+    return;
+  }
+}
+
+// DHCP se clients ko 2 DNS do
+// Compile error aaye (dhcps_set_dns nahi mila) to DHCP_DNS_TWO ko 0 kar do: tab sirf 1 DNS jayega.
+#define DHCP_DNS_TWO 1
+static void dhcpSetDns(IPAddress a, IPAddress b) {
+#if DHCP_DNS_TWO
+  WiFi.softAPDhcpServer().dhcps_set_dns(0, a);
+  WiFi.softAPDhcpServer().dhcps_set_dns(1, b);
+#else
+  WiFi.softAPDhcpServer().setDns(a);
+#endif
+}
+
+// IP ya hostname -> IP. Na mile to 0.0.0.0
+static IPAddress resolveDns(const char *nm) {
+  IPAddress ip(0, 0, 0, 0);
+  if (!nm[0]) return ip;
+  if (!ip.fromString(nm)) {
+    ip = IPAddress(0, 0, 0, 0);
+    if (!WiFi.hostByName(nm, ip, 3000)) ip = IPAddress(0, 0, 0, 0);
+  }
+  return ip;
 }
 
 void enableNapt() {
-  IPAddress d = WiFi.dnsIP(0);
+  IPAddress a, b;
   dnsState = 0;
-  if (cfg.dEn && cfg.dnsName[0]) {
+  if (cfg.tEn) {
+    a = b = apIP;   // transparent mode: clients ka DNS = repeater khud
+  } else if (cfg.dEn) {
+    // Custom DNS: koi fallback nahi. Jo set hai wahi clients ko jata hai.
     lastDnsTry = millis();
-    IPAddress custom(0, 0, 0, 0);
-    if (!custom.fromString(cfg.dnsName)) {   // hostname hai: router ke DNS se IP nikalo
-      if (!WiFi.hostByName(cfg.dnsName, custom, 4000)) custom = IPAddress(0, 0, 0, 0);
-    }
-    if (custom == IPAddress(0, 0, 0, 0)) dnsState = 2;
-    else if (!cfg.tEn && (dnsRc = dnsProbe(custom)) != 0) dnsState = 3;
-    else { d = custom; dnsState = 1; }
+    a = resolveDns(cfg.dnsName);
+    b = resolveDns(cfg.dnsName2);
+    if (a == IPAddress(0, 0, 0, 0)) a = b;
+    if (b == IPAddress(0, 0, 0, 0)) b = a;
+    if (a == IPAddress(0, 0, 0, 0)) { a = b = apIP; dnsState = 2; }   // naam resolve nahi hua: DNS band, 20 sec me dobara try
+    else dnsState = 1;
+  } else {
+    a = WiFi.dnsIP(0);   // custom band: router wala
+    b = WiFi.dnsIP(1);
+    if (a == IPAddress(0, 0, 0, 0)) a = IPAddress(8, 8, 8, 8);
+    if (b == IPAddress(0, 0, 0, 0)) b = a;
   }
-  if (d == IPAddress(0, 0, 0, 0)) d = IPAddress(8, 8, 8, 8);
-  if (cfg.tEn) d = apIP;   // transparent mode: clients ka DNS = repeater khud
-  dnsUsed = d;
-  WiFi.softAPDhcpServer().setDns(d);
+  dnsUsed = a;
+  dnsUsed2 = b;
+  pxUp[0] = pxUp[1] = IPAddress(0, 0, 0, 0);
+  pxCur = 0;
+  if (cfg.dEn && !cfg.tEn && dnsState == 1) {
+    pxUp[0] = a;           // custom DNS: repeater khud proxy banta hai, clients ko DNS = repeater
+    pxUp[1] = b;
+    a = b = apIP;
+  }
+  dhA = a;
+  dhB = b;
+  allowDns[0] = (uint32_t)a;
+  allowDns[1] = (uint32_t)b;
+  dhcpSetDns(a, b);
   if (!natOn) {
     err_t ret = ip_napt_init(NAPT_ENTRIES, NAPT_PORTS);
     if (ret == ERR_OK) ret = ip_napt_enable_no(SOFTAP_IF, 1);
@@ -706,6 +782,72 @@ static void tunnelLoop() {
 }
 // ================= Transparent proxy khatam =================
 
+// ===== DNS proxy: clients ka har DNS sawal repeater lekar AdGuard (DNS 1, fail ho to DNS 2) ko bhejta hai =====
+// Sirf UDP. Cache nahi. Custom DNS chalu ho tab hi kaam karta hai.
+#define PX_N 8
+static WiFiUDP dnsPx, dnsUp;
+static struct { uint32_t t; uint32_t cip; uint16_t cport, cid, uid; bool used; } px[PX_N];
+static uint8_t pxCur = 0;   // abhi kaun sa upstream (0 = DNS 1, 1 = DNS 2); jawab na aaye to badal jata hai
+static uint16_t pxSeq = 1;
+static uint8_t pxBuf[512];
+
+static void pxSend(int i, int n) {
+  dnsUp.beginPacket(pxUp[pxCur], 53);
+  dnsUp.write(pxBuf, n);
+  dnsUp.endPacket();
+}
+
+static void dnsProxyLoop() {
+  if (!cfg.dEn || cfg.tEn || pxUp[0] == IPAddress(0, 0, 0, 0)) return;
+  uint32_t now = millis();
+  // clients se naya sawal
+  for (int k = 0; k < 4; k++) {
+    int n = dnsPx.parsePacket();
+    if (n < 12) break;
+    if (n > (int)sizeof(pxBuf)) { dnsPx.flush(); continue; }
+    dnsPx.read(pxBuf, n);
+    int i = -1;
+    for (int j = 0; j < PX_N; j++) if (!px[j].used) { i = j; break; }
+    if (i < 0) continue;   // table bhari: sawal chhod do, client dobara bhejega
+    px[i].used = true;
+    px[i].t = now;
+    px[i].cip = (uint32_t)dnsPx.remoteIP();
+    px[i].cport = dnsPx.remotePort();
+    px[i].cid = ((uint16_t)pxBuf[0] << 8) | pxBuf[1];
+    px[i].uid = pxSeq++;
+    pxBuf[0] = px[i].uid >> 8;
+    pxBuf[1] = px[i].uid & 255;
+    pxSend(i, n);
+  }
+  // AdGuard se jawab
+  for (int k = 0; k < 4; k++) {
+    int n = dnsUp.parsePacket();
+    if (n < 12) break;
+    if (n > (int)sizeof(pxBuf)) { dnsUp.flush(); continue; }
+    dnsUp.read(pxBuf, n);
+    uint16_t id = ((uint16_t)pxBuf[0] << 8) | pxBuf[1];
+    for (int j = 0; j < PX_N; j++) {
+      if (px[j].used && px[j].uid == id) {
+        pxBuf[0] = px[j].cid >> 8;
+        pxBuf[1] = px[j].cid & 255;
+        dnsPx.beginPacket(IPAddress(px[j].cip), px[j].cport);
+        dnsPx.write(pxBuf, n);
+        dnsPx.endPacket();
+        px[j].used = false;
+        break;
+      }
+    }
+  }
+  // 1.2 sec me jawab nahi aaya: upstream badlo (client ka retry naye wale par jayega)
+  for (int j = 0; j < PX_N; j++) {
+    if (px[j].used && older(now, px[j].t, 1200UL)) {
+      px[j].used = false;
+      if (!(pxUp[1] == pxUp[0])) pxCur ^= 1;
+    }
+  }
+}
+// ================= DNS proxy khatam =================
+
 void handleRoot() {
   if (!auth()) return;
   bool ok = WiFi.status() == WL_CONNECTED;
@@ -741,10 +883,12 @@ void handleRoot() {
   h += row("Internet sharing (NAT)", natOn ? "<span class=g>Chalu</span>" : "<span class=r>Band</span>");
   if (!cfg.dEn) h += row("Client DNS", "Router wala (custom band)");
   else if (cfg.tEn) h += row("Client DNS", "Transparent mode me custom DNS kaam nahi karta");
-  else if (dnsState == 1) h += row("Client DNS", "<span class=g>Custom chalu</span> " + dnsUsed.toString());
-  else if (dnsState == 2) h += row("Client DNS", "<span class=r>Naam resolve nahi hua</span>, router wala chal raha");
-  else if (dnsState == 3) h += row("Client DNS", "<span class=r>Custom DNS " + String(dnsRc < 0 ? "ne jawab nahi diya (UDP 53 band ya server band)" : "ne mana kiya (code " + String(dnsRc) + "; 5 = REFUSED: NextDNS me apna IP link karna padega)") + "</span>, router wala chal raha");
-  else h += row("Client DNS", "Router judte hi lagega");
+  else {
+    if (dnsState == 1) h += row("Client DNS", "<span class=g>Custom chalu</span><br>" + dnsUsed.toString() + "<br>" + dnsUsed2.toString());
+    else if (dnsState == 2) h += row("Client DNS", "<span class=r>Naam resolve nahi hua</span>, 20 sec me dobara try");
+    else h += row("Client DNS", "Router judte hi lagega");
+    h += row("DNS lock", cfg.dLock ? "<span class=g>Chalu</span>, roke: " + String(lockDrops) : String("Band"));
+  }
   if (cfg.linkUrl[0]) h += row("NextDNS link", linkMsg[0] ? esc(String(linkMsg)) : String("abhi tak call nahi hua"));
   if (cfg.tEn) {
     h += row("Transparent proxy", "<span class=g>Chalu</span> (panel port " + String(PANEL_ALT_PORT) + ")");
@@ -796,14 +940,19 @@ void handleRoot() {
   h = F("<div class=c><h3>DNS</h3><form method=POST action='/dnsset'>");
   h += F("<label><input type=checkbox name=de value=1 style='width:auto' ");
   if (cfg.dEn) h += F("checked");
-  h += F("> Custom DNS chalu</label><label>DNS (IP ya hostname, jaise 8.8.8.8 ya f8cefc.dns.nextdns.io)</label><input name=dn value='");
+  h += F("> Custom DNS chalu</label><label>DNS 1 - primary (IP ya hostname: 94.140.14.14 ya dns.adguard-dns.com)</label><input name=dn value='");
   h += esc(String(cfg.dnsName));
-  h += F("'><label>NextDNS link URL (https://link-ip.nextdns.io/...; khali = band). Secret hai</label><input name=lu type=password value='");
+  h += F("'><label>DNS 2 - secondary (IP ya hostname, khali ho sakta hai: 94.140.15.15)</label><input name=dn2 value='");
+  h += esc(String(cfg.dnsName2));
+  h += F("'><label><input type=checkbox name=dl value=1 style='width:auto' ");
+  if (cfg.dLock) h += F("checked");
+  h += F("> DNS lock: device apna alag DNS / DoT use kare to rok do</label>");
+  h += F("<label>Link URL (NextDNS ya AdGuard linked-IP, https://...; khali = band). Secret hai</label><input name=lu type=password value='");
   h += esc(String(cfg.linkUrl));
   h += F("'><button type=submit>DNS save karo (restart nahi)</button></form>");
   h += F("<a class=b href='/dnstog'>");
   h += cfg.dEn ? F("DNS BAND karo") : F("DNS CHALU karo");
-  h += F("</a><p style='font-size:13px;opacity:.75'>Naya DNS devices ko tab milega jab wo WiFi dobara judein. Hostname ho to repeater uska IP nikalta hai (router juda hona chahiye). DNS jawab na de to router wala DNS hi chalta hai, net nahi rukega.</p></div>");
+  h += F("</a><p style='font-size:13px;opacity:.75'>Naya DNS devices ko tab milega jab wo WiFi dobara judein. Hostname ho to repeater uska IP nikalta hai (router juda hona chahiye). Dono DNS fail hon to router wala DNS chalta hai, net nahi rukega. DNS lock chalu ho to phone me alag/static DNS ya Private DNS kaam nahi karega, phone ko DHCP (automatic) par rakho.</p></div>");
   server.sendContent(h);
 
   h = F("<div class=c><h3>Proxy</h3><form method=POST action='/saveproxy'>");
@@ -857,7 +1006,8 @@ void handleKick() {
       delay(200);
       WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
       WiFi.softAP(cfg.aSsid, strlen(cfg.aPass) >= 8 ? cfg.aPass : nullptr, 1, 0, 8);
-      WiFi.softAPDhcpServer().setDns(cfg.tEn ? apIP : (dnsUsed == IPAddress(0, 0, 0, 0) ? WiFi.dnsIP(0) : dnsUsed));
+      IPAddress k1 = (dhA == IPAddress(0, 0, 0, 0)) ? WiFi.dnsIP(0) : dhA;
+      dhcpSetDns(k1, (dhB == IPAddress(0, 0, 0, 0)) ? k1 : dhB);
     }
   }
   server.sendHeader("Location", "/");
@@ -990,16 +1140,22 @@ void handleDnsSet() {
   if (!auth()) return;
   String dn = server.arg("dn");
   dn.trim();
+  String dn2 = server.arg("dn2");
+  dn2.trim();
   bool en = server.hasArg("de");
-  bool bad = dn.length() > 63 || (en && dn.length() < 1);
+  bool bad = dn.length() > 63 || dn2.length() > 63 || (en && dn.length() < 1 && dn2.length() < 1);
   for (unsigned i = 0; i < dn.length() && !bad; i++) {
     char c = dn[i];
+    if (!(isalnum((unsigned char)c) || c == '.' || c == '-' || c == '_')) bad = true;
+  }
+  for (unsigned i = 0; i < dn2.length() && !bad; i++) {
+    char c = dn2[i];
     if (!(isalnum((unsigned char)c) || c == '.' || c == '-' || c == '_')) bad = true;
   }
   if (bad) {
     server.send(400, "text/html",
       "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-      "<body style='font-family:sans-serif;padding:16px'>DNS galat hai. IP (8.8.8.8) ya hostname (f8cefc.dns.nextdns.io) likho. <a href='/'>Wapas</a></body>");
+      "<body style='font-family:sans-serif;padding:16px'>DNS galat hai. IP (94.140.14.14) ya hostname (dns.adguard-dns.com) likho. <a href='/'>Wapas</a></body>");
     return;
   }
   String lu = server.arg("lu");
@@ -1022,9 +1178,13 @@ void handleDnsSet() {
   cfg.dEn = en ? 1 : 0;
   memset(cfg.dnsName, 0, sizeof(cfg.dnsName));
   strncpy(cfg.dnsName, dn.c_str(), 63);
+  memset(cfg.dnsName2, 0, sizeof(cfg.dnsName2));
+  strncpy(cfg.dnsName2, dn2.c_str(), 63);
+  cfg.dLock = server.hasArg("dl") ? 1 : 0;
   memset(cfg.dns, 0, sizeof(cfg.dns));   // purana field ab use nahi hota
   saveConfig();
   applyDnsNow();
+  lockHookCheck();
   server.sendHeader("Location", "/");
   server.send(303);
 }
@@ -1032,7 +1192,7 @@ void handleDnsSet() {
 void handleDnsToggle() {
   if (!auth()) return;
   if (cfg.dEn) cfg.dEn = 0;
-  else if (cfg.dnsName[0]) cfg.dEn = 1;
+  else if (cfg.dnsName[0] || cfg.dnsName2[0]) cfg.dEn = 1;
   saveConfig();
   applyDnsNow();
   server.sendHeader("Location", "/");
@@ -1077,14 +1237,16 @@ void setup() {
   server.on("/reboot", handleReboot);
   server.on("/reset", handleReset);
   if (cfg.tEn) {
-    WiFi.softAPDhcpServer().setDns(apIP);
+    dhcpSetDns(apIP, apIP);
     dnsSrv.start(53, "*", apIP);   // har naam ka jawab = repeater ka IP
     tsrv80.begin();
     tsrv80.setNoDelay(true);
     tsrv443.begin();
     tsrv443.setNoDelay(true);
   }
+  if (!cfg.tEn) { dnsPx.begin(53); dnsUp.begin(40053); }
   server.begin(cfg.tEn ? PANEL_ALT_PORT : 80);
+  lockHookCheck();
   Serial.println(cfg.tEn ? "Panel: http://10.10.10.1:8080 (transparent mode)" : "Panel: http://10.10.10.1");
 
   // Router se connect (background me, setup ko rokta nahi)
@@ -1095,9 +1257,11 @@ void setup() {
 
 void loop() {
   server.handleClient();
-  if (cfg.tEn) tunnelLoop();
+  if (cfg.tEn) tunnelLoop(); else dnsProxyLoop();
   uint32_t now = millis();
   bool ok = (WiFi.status() == WL_CONNECTED);
+  static uint32_t lastHook = 0;
+  if (cfg.dLock && older(now, lastHook, 2000UL)) { lastHook = now; lockHookCheck(); }   // AP restart ho to hook dobara
 
   if (ok) {
     if (!wasOk) {            // abhi-abhi juda (pehli baar ya router wapas aaya)
@@ -1116,7 +1280,7 @@ void loop() {
       enableNapt();
     }
     // custom DNS pehle fail hua tha: 2 min baad dobara try
-    if (cfg.dEn && !cfg.tEn && (dnsState == 2 || dnsState == 3) && older(now, lastDnsTry, 120000UL)) enableNapt();
+    if (cfg.dEn && !cfg.tEn && dnsState == 2 && older(now, lastDnsTry, 20000UL)) enableNapt();
     // NextDNS link: har 5 min me IP update (4G ka IP badalta rehta hai)
     if (cfg.dEn && !cfg.tEn && cfg.linkUrl[0] && netLat >= 0 && (lastLink == 0 || older(now, lastLink, 300000UL))) doLink();
 #if NET_CHECK

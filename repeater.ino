@@ -8,6 +8,8 @@
 //   net hai = blink: tez blink = net fast, dheere blink = net slow.
 // Router band/password galat ho to bhi repeater WiFi + panel chalta rahega, aur router ko baar-baar try karta rahega.
 // Transparent mode (Proxy card me checkbox): DNS hijack + tunnel, device me proxy setting nahi; panel tab :8080 par.
+// DNS card: custom DNS (IP ya hostname) ON/OFF, bina restart. Hostname ho to repeater khud IP nikalta hai, aur test karta hai;
+//   DNS jawab na de to router wala DNS hi chalta rahe (client ka net na ruke).
 // FLASH button 5 sec dabao = factory reset. Net 5 min tak na mile to router se dobara judta hai.
 
 #include <ESP8266WiFi.h>
@@ -17,6 +19,7 @@
 #include <lwip/napt.h>
 #include <lwip/dns.h>
 #include <DNSServer.h>
+#include <WiFiUdp.h>
 
 struct Tun;   // forward declaration: Arduino auto-prototype ke liye zaroori
 
@@ -33,6 +36,7 @@ struct Tun;   // forward declaration: Arduino auto-prototype ke liye zaroori
 #define CFG_MAGIC4 0x5A5A0004
 #define CFG_MAGIC5 0x5A5A0005
 #define CFG_MAGIC6 0x5A5A0006
+#define CFG_MAGIC7 0x5A5A0007
 // Repeater ka default network: 10.10.<ye number>.1  (is board ke liye chaho to 20 kar do)
 #define DEFAULT_AP_OCT 10
 
@@ -57,6 +61,9 @@ struct Config {
   char apMac[18];   // repeater (AP) MAC, khali = board ka apna
   uint32_t magic6;
   uint8_t tEn;      // transparent proxy (DNS hijack + tunnel) chalu?
+  uint32_t magic7;
+  uint8_t dEn;      // custom DNS chalu? (1 = haan, 0 = router wala DNS)
+  char dnsName[64]; // custom DNS: IP ya hostname (jaise 8.8.8.8 / f8cefc.dns.nextdns.io)
 };
 
 Config cfg;
@@ -67,6 +74,9 @@ bool wasOk = false;
 uint32_t lastTick = 0;
 uint32_t lastRetry = 0, discSince = 0, lastNet = 0, badSince = 0, btnSince = 0;
 int netLat = -2;   // -2 = naap rahe, -1 = internet nahi, >=0 = ms
+IPAddress dnsUsed(0, 0, 0, 0);   // clients ko abhi jo DNS mil raha hai
+uint8_t dnsState = 0;            // 0 = custom band/abhi nahi laga, 1 = custom chalu, 2 = naam resolve nahi hua, 3 = DNS ne jawab nahi diya
+uint32_t lastDnsTry = 0;
 extern "C" bool wifi_softap_deauth(uint8_t mac[6]) __attribute__((weak));
 #define wifi_softap_deauth_w wifi_softap_deauth
 
@@ -146,6 +156,14 @@ void loadConfig() {
     cfg.magic6 = CFG_MAGIC6;
     cfg.tEn = 0;
   }
+  if (cfg.magic7 != CFG_MAGIC7) {
+    cfg.magic7 = CFG_MAGIC7;
+    memset(cfg.dnsName, 0, sizeof(cfg.dnsName));
+    strncpy(cfg.dnsName, cfg.dns, 15);   // purana IP wala DNS yahin le aao
+    cfg.dEn = cfg.dns[0] ? 1 : 0;
+  }
+  cfg.dEn = cfg.dEn ? 1 : 0;
+  cfg.dnsName[63] = 0;
   cfg.tEn = cfg.tEn ? 1 : 0;
   cfg.apMac[17] = 0;
   if (cfg.apOct < 1 || cfg.apOct > 254) cfg.apOct = DEFAULT_AP_OCT;
@@ -192,12 +210,46 @@ bool auth() {
   return true;
 }
 
+// Ek chhota DNS sawal (google.com) bhej ke dekho: DNS server theek jawab deta hai ya nahi.
+static bool dnsWorks(IPAddress ip) {
+  WiFiUDP u;
+  if (!u.begin(40000 + (millis() & 0x3FFF))) return false;
+  const uint8_t q[] = {0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0,
+                       6, 'g', 'o', 'o', 'g', 'l', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1};
+  u.beginPacket(ip, 53);
+  u.write(q, sizeof(q));
+  u.endPacket();
+  uint32_t t0 = millis();
+  while ((millis() - t0) < 1500) {
+    int n = u.parsePacket();
+    if (n >= 12) {
+      uint8_t r[12];
+      u.read(r, 12);
+      u.stop();
+      return r[0] == 0x12 && r[1] == 0x34 && (r[3] & 0x0F) == 0;   // id mila + error nahi
+    }
+    delay(5);
+  }
+  u.stop();
+  return false;
+}
+
 void enableNapt() {
   IPAddress d = WiFi.dnsIP(0);
-  IPAddress custom;
-  if (cfg.dns[0] && custom.fromString(cfg.dns)) d = custom;
+  dnsState = 0;
+  if (cfg.dEn && cfg.dnsName[0]) {
+    lastDnsTry = millis();
+    IPAddress custom(0, 0, 0, 0);
+    if (!custom.fromString(cfg.dnsName)) {   // hostname hai: router ke DNS se IP nikalo
+      if (!WiFi.hostByName(cfg.dnsName, custom, 4000)) custom = IPAddress(0, 0, 0, 0);
+    }
+    if (custom == IPAddress(0, 0, 0, 0)) dnsState = 2;
+    else if (!cfg.tEn && !dnsWorks(custom)) dnsState = 3;
+    else { d = custom; dnsState = 1; }
+  }
   if (d == IPAddress(0, 0, 0, 0)) d = IPAddress(8, 8, 8, 8);
   if (cfg.tEn) d = apIP;   // transparent mode: clients ka DNS = repeater khud
+  dnsUsed = d;
   WiFi.softAPDhcpServer().setDns(d);
   if (!natOn) {
     err_t ret = ip_napt_init(NAPT_ENTRIES, NAPT_PORTS);
@@ -615,6 +667,12 @@ void handleRoot() {
   h += row("Repeater IP", apIP.toString());
   h += row("Repeater MAC", WiFi.softAPmacAddress());
   h += row("Internet sharing (NAT)", natOn ? "<span class=g>Chalu</span>" : "<span class=r>Band</span>");
+  if (!cfg.dEn) h += row("Client DNS", "Router wala (custom band)");
+  else if (cfg.tEn) h += row("Client DNS", "Transparent mode me custom DNS kaam nahi karta");
+  else if (dnsState == 1) h += row("Client DNS", "<span class=g>Custom chalu</span> " + dnsUsed.toString());
+  else if (dnsState == 2) h += row("Client DNS", "<span class=r>Naam resolve nahi hua</span>, router wala chal raha");
+  else if (dnsState == 3) h += row("Client DNS", "<span class=r>Custom DNS ne jawab nahi diya</span>, router wala chal raha");
+  else h += row("Client DNS", "Router judte hi lagega");
   if (cfg.tEn) {
     h += row("Transparent proxy", "<span class=g>Chalu</span> (panel port " + String(PANEL_ALT_PORT) + ")");
     h += row("Tunnel", "ok " + String(tunOk) + " / fail " + String(tunFail));
@@ -654,14 +712,23 @@ void handleRoot() {
   h += esc(String(cfg.aSsid));
   h += F("'><label>Repeater ka password (8+ ya khali)</label><input name=ap value='");
   h += esc(String(cfg.aPass));
-  h += F("'><label>DNS (khali = router wala, jaise 8.8.8.8)</label><input name=dn value='");
-  h += esc(String(cfg.dns));
   h += F("'><label>Repeater network number (10.10.__.1). Repeater ko repeater se jodo to alag rakho</label><input name=an type=number min=1 max=254 value='");
   h += String(cfg.apOct);
   h += F("'><label>Repeater MAC (khali = board ka apna, jaise 02:11:22:33:44:55)</label><input name=am value='");
   h += esc(String(cfg.apMac));
   h += F("'><label>Panel ka password (khali = purana)</label><input name=ad value=''>");
   h += F("<button type=submit>Save aur restart</button></form></div>");
+  server.sendContent(h);
+
+  h = F("<div class=c><h3>DNS</h3><form method=POST action='/dnsset'>");
+  h += F("<label><input type=checkbox name=de value=1 style='width:auto' ");
+  if (cfg.dEn) h += F("checked");
+  h += F("> Custom DNS chalu</label><label>DNS (IP ya hostname, jaise 8.8.8.8 ya f8cefc.dns.nextdns.io)</label><input name=dn value='");
+  h += esc(String(cfg.dnsName));
+  h += F("'><button type=submit>DNS save karo (restart nahi)</button></form>");
+  h += F("<a class=b href='/dnstog'>");
+  h += cfg.dEn ? F("DNS BAND karo") : F("DNS CHALU karo");
+  h += F("</a><p style='font-size:13px;opacity:.75'>Naya DNS devices ko tab milega jab wo WiFi dobara judein. Hostname ho to repeater uska IP nikalta hai (router juda hona chahiye). DNS jawab na de to router wala DNS hi chalta hai, net nahi rukega.</p></div>");
   server.sendContent(h);
 
   h = F("<div class=c><h3>Proxy</h3><form method=POST action='/saveproxy'>");
@@ -715,7 +782,7 @@ void handleKick() {
       delay(200);
       WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
       WiFi.softAP(cfg.aSsid, strlen(cfg.aPass) >= 8 ? cfg.aPass : nullptr, 1, 0, 8);
-      WiFi.softAPDhcpServer().setDns(cfg.tEn ? apIP : WiFi.dnsIP(0));
+      WiFi.softAPDhcpServer().setDns(cfg.tEn ? apIP : (dnsUsed == IPAddress(0, 0, 0, 0) ? WiFi.dnsIP(0) : dnsUsed));
     }
   }
   server.sendHeader("Location", "/");
@@ -730,20 +797,16 @@ void handleSave() {
   String ap = server.arg("ap");
   String ad = server.arg("ad");
   int an = server.arg("an").toInt();
-  String dn = server.arg("dn");
   String am = server.arg("am");
   am.trim();
   uint8_t amt[6];
   bool macBad = am.length() > 0 && (!parseMac(am.c_str(), amt) || (amt[0] & 1));
-  dn.trim();
-  IPAddress dtest;
-  bool dnsBad = dn.length() > 0 && (dn.length() > 15 || !dtest.fromString(dn));
   if (as.length() < 1 || as.length() > 32 || rs.length() > 32 || rp.length() > 64 ||
       ap.length() > 64 || (ap.length() > 0 && ap.length() < 8) ||
-      ad.length() > 32 || (ad.length() > 0 && ad.length() < 4) || dnsBad || macBad || an < 1 || an > 254) {
+      ad.length() > 32 || (ad.length() > 0 && ad.length() < 4) || macBad || an < 1 || an > 254) {
     server.send(400, "text/html",
       "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-      "<body style='font-family:sans-serif;padding:16px'>Galat input. Repeater password 8+ character ka ho (ya khali), panel password 4+ ka, DNS sahi IP ho (jaise 8.8.8.8), MAC aisa ho 02:11:22:33:44:55. <a href='/'>Wapas</a></body>");
+      "<body style='font-family:sans-serif;padding:16px'>Galat input. Repeater password 8+ character ka ho (ya khali), panel password 4+ ka, MAC aisa ho 02:11:22:33:44:55. <a href='/'>Wapas</a></body>");
     return;
   }
   memset(cfg.rSsid, 0, sizeof(cfg.rSsid));
@@ -754,8 +817,6 @@ void handleSave() {
   strncpy(cfg.rPass, rp.c_str(), 64);
   strncpy(cfg.aSsid, as.c_str(), 32);
   strncpy(cfg.aPass, ap.c_str(), 64);
-  memset(cfg.dns, 0, sizeof(cfg.dns));
-  strncpy(cfg.dns, dn.c_str(), 15);
   cfg.apOct = (uint8_t)an;
   memset(cfg.apMac, 0, sizeof(cfg.apMac));
   strncpy(cfg.apMac, am.c_str(), 17);
@@ -845,6 +906,47 @@ void handleReset() {
   ESP.restart();
 }
 
+static void applyDnsNow() {
+  if (WiFi.status() == WL_CONNECTED) enableNapt();   // abhi DHCP DNS badal do
+  else dnsState = 0;
+}
+
+void handleDnsSet() {
+  if (!auth()) return;
+  String dn = server.arg("dn");
+  dn.trim();
+  bool en = server.hasArg("de");
+  bool bad = dn.length() > 63 || (en && dn.length() < 1);
+  for (unsigned i = 0; i < dn.length() && !bad; i++) {
+    char c = dn[i];
+    if (!(isalnum((unsigned char)c) || c == '.' || c == '-' || c == '_')) bad = true;
+  }
+  if (bad) {
+    server.send(400, "text/html",
+      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<body style='font-family:sans-serif;padding:16px'>DNS galat hai. IP (8.8.8.8) ya hostname (f8cefc.dns.nextdns.io) likho. <a href='/'>Wapas</a></body>");
+    return;
+  }
+  cfg.dEn = en ? 1 : 0;
+  memset(cfg.dnsName, 0, sizeof(cfg.dnsName));
+  strncpy(cfg.dnsName, dn.c_str(), 63);
+  memset(cfg.dns, 0, sizeof(cfg.dns));   // purana field ab use nahi hota
+  saveConfig();
+  applyDnsNow();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleDnsToggle() {
+  if (!auth()) return;
+  if (cfg.dEn) cfg.dEn = 0;
+  else if (cfg.dnsName[0]) cfg.dEn = 1;
+  saveConfig();
+  applyDnsNow();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
 void setup() {
 #if USE_160MHZ
   system_update_cpu_freq(SYS_CPU_160MHZ);   // NAT ke liye tez CPU (80 -> 160 MHz)
@@ -877,6 +979,8 @@ void setup() {
   server.on("/kick", handleKick);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/saveproxy", HTTP_POST, handleProxySave);
+  server.on("/dnsset", HTTP_POST, handleDnsSet);
+  server.on("/dnstog", handleDnsToggle);
   server.on("/proxy.pac", handlePac);
   server.on("/reboot", handleReboot);
   server.on("/reset", handleReset);
@@ -919,6 +1023,8 @@ void loop() {
       lastNet = 0;
       enableNapt();
     }
+    // custom DNS pehle fail hua tha: 5 min baad dobara try
+    if (cfg.dEn && !cfg.tEn && (dnsState == 2 || dnsState == 3) && now - lastDnsTry > 300000UL) enableNapt();
 #if NET_CHECK
     if (now - lastNet > (netLat < 0 ? 10000UL : 60000UL)) {
       lastNet = now;

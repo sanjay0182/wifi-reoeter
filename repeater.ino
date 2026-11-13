@@ -77,6 +77,7 @@ int netLat = -2;   // -2 = naap rahe, -1 = internet nahi, >=0 = ms
 IPAddress dnsUsed(0, 0, 0, 0);   // clients ko abhi jo DNS mil raha hai
 uint8_t dnsState = 0;            // 0 = custom band/abhi nahi laga, 1 = custom chalu, 2 = naam resolve nahi hua, 3 = DNS ne jawab nahi diya
 uint32_t lastDnsTry = 0;
+int dnsRc = -1;                  // DNS test ka natija: -1 = koi jawab nahi, 0 = theek, 5 = REFUSED (mana kiya) etc.
 extern "C" bool wifi_softap_deauth(uint8_t mac[6]) __attribute__((weak));
 #define wifi_softap_deauth_w wifi_softap_deauth
 
@@ -210,28 +211,30 @@ bool auth() {
   return true;
 }
 
-// Ek chhota DNS sawal (google.com) bhej ke dekho: DNS server theek jawab deta hai ya nahi.
-static bool dnsWorks(IPAddress ip) {
+// Ek chhota DNS sawal (google.com) bhej ke dekho. 3 baar try (pehla packet router judte hi kho sakta hai).
+// Return: -1 = koi jawab nahi, warna DNS ka error code (0 = theek, 5 = REFUSED = server ne mana kiya).
+static int dnsProbe(IPAddress ip) {
   WiFiUDP u;
-  if (!u.begin(40000 + (millis() & 0x3FFF))) return false;
+  if (!u.begin(40000 + (millis() & 0x3FFF))) return -1;
   const uint8_t q[] = {0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0,
                        6, 'g', 'o', 'o', 'g', 'l', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1};
-  u.beginPacket(ip, 53);
-  u.write(q, sizeof(q));
-  u.endPacket();
-  uint32_t t0 = millis();
-  while ((millis() - t0) < 1500) {
-    int n = u.parsePacket();
-    if (n >= 12) {
-      uint8_t r[12];
-      u.read(r, 12);
-      u.stop();
-      return r[0] == 0x12 && r[1] == 0x34 && (r[3] & 0x0F) == 0;   // id mila + error nahi
+  for (int tr = 0; tr < 3; tr++) {
+    u.beginPacket(ip, 53);
+    u.write(q, sizeof(q));
+    u.endPacket();
+    uint32_t t0 = millis();
+    while ((millis() - t0) < 1200) {
+      int n = u.parsePacket();
+      if (n >= 12) {
+        uint8_t r[12];
+        u.read(r, 12);
+        if (r[0] == 0x12 && r[1] == 0x34) { u.stop(); return r[3] & 0x0F; }
+      }
+      delay(5);
     }
-    delay(5);
   }
   u.stop();
-  return false;
+  return -1;
 }
 
 void enableNapt() {
@@ -244,7 +247,7 @@ void enableNapt() {
       if (!WiFi.hostByName(cfg.dnsName, custom, 4000)) custom = IPAddress(0, 0, 0, 0);
     }
     if (custom == IPAddress(0, 0, 0, 0)) dnsState = 2;
-    else if (!cfg.tEn && !dnsWorks(custom)) dnsState = 3;
+    else if (!cfg.tEn && (dnsRc = dnsProbe(custom)) != 0) dnsState = 3;
     else { d = custom; dnsState = 1; }
   }
   if (d == IPAddress(0, 0, 0, 0)) d = IPAddress(8, 8, 8, 8);
@@ -671,7 +674,7 @@ void handleRoot() {
   else if (cfg.tEn) h += row("Client DNS", "Transparent mode me custom DNS kaam nahi karta");
   else if (dnsState == 1) h += row("Client DNS", "<span class=g>Custom chalu</span> " + dnsUsed.toString());
   else if (dnsState == 2) h += row("Client DNS", "<span class=r>Naam resolve nahi hua</span>, router wala chal raha");
-  else if (dnsState == 3) h += row("Client DNS", "<span class=r>Custom DNS ne jawab nahi diya</span>, router wala chal raha");
+  else if (dnsState == 3) h += row("Client DNS", "<span class=r>Custom DNS " + String(dnsRc < 0 ? "ne jawab nahi diya (UDP 53 band ya server band)" : "ne mana kiya (code " + String(dnsRc) + "; 5 = REFUSED: NextDNS me apna IP link karna padega)") + "</span>, router wala chal raha");
   else h += row("Client DNS", "Router judte hi lagega");
   if (cfg.tEn) {
     h += row("Transparent proxy", "<span class=g>Chalu</span> (panel port " + String(PANEL_ALT_PORT) + ")");
@@ -1023,8 +1026,8 @@ void loop() {
       lastNet = 0;
       enableNapt();
     }
-    // custom DNS pehle fail hua tha: 5 min baad dobara try
-    if (cfg.dEn && !cfg.tEn && (dnsState == 2 || dnsState == 3) && now - lastDnsTry > 300000UL) enableNapt();
+    // custom DNS pehle fail hua tha: 2 min baad dobara try
+    if (cfg.dEn && !cfg.tEn && (dnsState == 2 || dnsState == 3) && now - lastDnsTry > 120000UL) enableNapt();
 #if NET_CHECK
     if (now - lastNet > (netLat < 0 ? 10000UL : 60000UL)) {
       lastNet = now;

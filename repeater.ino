@@ -95,6 +95,7 @@ IPAddress dnsUsed2(0, 0, 0, 0);  // clients ko abhi jo secondary DNS mil raha ha
 static volatile uint32_t allowDns[2] = {0, 0};   // DNS lock: jin IP par port 53 jaane dena hai
 IPAddress dhA(0, 0, 0, 0), dhB(0, 0, 0, 0);     // DHCP se clients ko jo DNS jata hai
 static IPAddress pxUp[2];                        // DNS proxy ke upstream (AdGuard 1 / 2)
+static uint8_t pxCur = 0;   // abhi kaun sa upstream (0 = DNS 1, 1 = DNS 2); jawab na aaye to badal jata hai
 static uint32_t lockDrops = 0;                   // DNS lock ne ab tak kitne packet roke
 extern "C" bool wifi_softap_deauth(uint8_t mac[6]) __attribute__((weak));
 #define wifi_softap_deauth_w wifi_softap_deauth
@@ -285,16 +286,40 @@ static void lockHookCheck() {
   }
 }
 
-// DHCP se clients ko 2 DNS do
-// Compile error aaye (dhcps_set_dns nahi mila) to DHCP_DNS_TWO ko 0 kar do: tab sirf 1 DNS jayega.
-#define DHCP_DNS_TWO 1
+// DHCP se clients ko 2 DNS do.
+// ESP8266 core ke alag version me DhcpServer ka function naam/type alag hai (dhcps_set_dns ya setDns,
+// ip4_addr_t* ya IPAddress). Compiler khud wahi chunta hai jo core me hai, isliye compile error nahi aata.
+template <int N> struct DPrio : DPrio<N - 1> {};
+template <> struct DPrio<0> {};
+
+template <class D>
+auto dhcpSetOne(D &d, int n, uint32_t v, DPrio<4>) -> decltype(d.dhcps_set_dns(n, (const ip4_addr_t *)nullptr), void()) {
+  ip4_addr_t x;
+  x.addr = v;
+  d.dhcps_set_dns(n, &x);
+}
+template <class D>
+auto dhcpSetOne(D &d, int n, uint32_t v, DPrio<3>) -> decltype(d.setDns(n, (const ip4_addr_t *)nullptr), void()) {
+  ip4_addr_t x;
+  x.addr = v;
+  d.setDns(n, &x);
+}
+template <class D>
+auto dhcpSetOne(D &d, int n, uint32_t v, DPrio<2>) -> decltype(d.dhcps_set_dns(n, IPAddress()), void()) {
+  d.dhcps_set_dns(n, IPAddress(v));
+}
+template <class D>
+auto dhcpSetOne(D &d, int n, uint32_t v, DPrio<1>) -> decltype(d.setDns(n, IPAddress()), void()) {
+  d.setDns(n, IPAddress(v));
+}
+template <class D>
+void dhcpSetOne(D &, int, uint32_t, DPrio<0>) {
+  Serial.println("DHCP DNS set API nahi mili");
+}
+
 static void dhcpSetDns(IPAddress a, IPAddress b) {
-#if DHCP_DNS_TWO
-  WiFi.softAPDhcpServer().dhcps_set_dns(0, a);
-  WiFi.softAPDhcpServer().dhcps_set_dns(1, b);
-#else
-  WiFi.softAPDhcpServer().setDns(a);
-#endif
+  dhcpSetOne(WiFi.softAPDhcpServer(), 0, (uint32_t)a, DPrio<4>());
+  dhcpSetOne(WiFi.softAPDhcpServer(), 1, (uint32_t)b, DPrio<4>());
 }
 
 // IP ya hostname -> IP. Na mile to 0.0.0.0
@@ -787,7 +812,6 @@ static void tunnelLoop() {
 #define PX_N 8
 static WiFiUDP dnsPx, dnsUp;
 static struct { uint32_t t; uint32_t cip; uint16_t cport, cid, uid; bool used; } px[PX_N];
-static uint8_t pxCur = 0;   // abhi kaun sa upstream (0 = DNS 1, 1 = DNS 2); jawab na aaye to badal jata hai
 static uint16_t pxSeq = 1;
 static uint8_t pxBuf[512];
 

@@ -20,6 +20,7 @@
 #include <lwip/dns.h>
 #include <DNSServer.h>
 #include <WiFiUdp.h>
+#include <WiFiClientSecureBearSSL.h>
 
 struct Tun;   // forward declaration: Arduino auto-prototype ke liye zaroori
 
@@ -37,6 +38,7 @@ struct Tun;   // forward declaration: Arduino auto-prototype ke liye zaroori
 #define CFG_MAGIC5 0x5A5A0005
 #define CFG_MAGIC6 0x5A5A0006
 #define CFG_MAGIC7 0x5A5A0007
+#define CFG_MAGIC8 0x5A5A0008
 // Repeater ka default network: 10.10.<ye number>.1  (is board ke liye chaho to 20 kar do)
 #define DEFAULT_AP_OCT 10
 
@@ -64,6 +66,8 @@ struct Config {
   uint32_t magic7;
   uint8_t dEn;      // custom DNS chalu? (1 = haan, 0 = router wala DNS)
   char dnsName[64]; // custom DNS: IP ya hostname (jaise 8.8.8.8 / f8cefc.dns.nextdns.io)
+  uint32_t magic8;
+  char linkUrl[96]; // NextDNS link-ip URL (https://link-ip.nextdns.io/ID/TOKEN), khali = band. Secret hai.
 };
 
 Config cfg;
@@ -77,6 +81,9 @@ int netLat = -2;   // -2 = naap rahe, -1 = internet nahi, >=0 = ms
 IPAddress dnsUsed(0, 0, 0, 0);   // clients ko abhi jo DNS mil raha hai
 uint8_t dnsState = 0;            // 0 = custom band/abhi nahi laga, 1 = custom chalu, 2 = naam resolve nahi hua, 3 = DNS ne jawab nahi diya
 uint32_t lastDnsTry = 0;
+uint32_t lastLink = 0;            // link call ka waqt (0 = abhi karna hai)
+int linkCode = 0;                // 200 = link ho gaya, 0 = abhi call nahi hua / fail
+char linkMsg[64] = "";           // link call ka natija (token kabhi nahi likhta)
 int dnsRc = -1;                  // DNS test ka natija: -1 = koi jawab nahi, 0 = theek, 5 = REFUSED (mana kiya) etc.
 extern "C" bool wifi_softap_deauth(uint8_t mac[6]) __attribute__((weak));
 #define wifi_softap_deauth_w wifi_softap_deauth
@@ -163,6 +170,11 @@ void loadConfig() {
     strncpy(cfg.dnsName, cfg.dns, 15);   // purana IP wala DNS yahin le aao
     cfg.dEn = cfg.dns[0] ? 1 : 0;
   }
+  if (cfg.magic8 != CFG_MAGIC8) {
+    cfg.magic8 = CFG_MAGIC8;
+    memset(cfg.linkUrl, 0, sizeof(cfg.linkUrl));
+  }
+  cfg.linkUrl[95] = 0;
   cfg.dEn = cfg.dEn ? 1 : 0;
   cfg.dnsName[63] = 0;
   cfg.tEn = cfg.tEn ? 1 : 0;
@@ -259,6 +271,63 @@ void enableNapt() {
     if (ret == ERR_OK) ret = ip_napt_enable_no(SOFTAP_IF, 1);
     natOn = (ret == ERR_OK);
     Serial.println(natOn ? "NAT chalu" : "NAT fail (lwIP variant check karo)");
+  }
+}
+
+// NextDNS "link-ip" URL par https GET bhejo: NextDNS ko repeater ke net ka abhi ka public IP mil jata hai.
+// RAM kam hai: pehle chhota TLS buffer (MFLN) try, nahi to 4 KB; heap kam ho to call chhod ke baad me.
+static void doLink() {
+  lastLink = millis();
+  if (!lastLink) lastLink = 1;
+  linkCode = 0;
+  const char *u = cfg.linkUrl;
+  if (strncmp(u, "https://", 8) != 0) { strcpy(linkMsg, "URL https:// se shuru hona chahiye"); return; }
+  u += 8;
+  const char *sl = strchr(u, '/');
+  char host[64];
+  if (!sl || (sl - u) < 3 || (sl - u) >= (int)sizeof(host)) { strcpy(linkMsg, "URL galat (host/path)"); return; }
+  memcpy(host, u, sl - u);
+  host[sl - u] = 0;
+  if (ESP.getFreeHeap() < 14000) { strcpy(linkMsg, "RAM kam, baad me try"); return; }
+  {
+    BearSSL::WiFiClientSecure c;
+    c.setInsecure();   // certificate check nahi (RAM bachane ke liye)
+    bool mf = c.probeMaxFragmentLength(host, 443, 512);
+    if (mf) c.setBufferSizes(512, 512);
+    else c.setBufferSizes(4096, 512);
+    c.setTimeout(6000);
+    if (!c.connect(host, 443)) {
+      snprintf(linkMsg, sizeof(linkMsg), "TLS/connect fail (ssl err %d, mfln %d)", c.getLastSSLError(), mf ? 1 : 0);
+      return;
+    }
+    c.print("GET ");
+    c.print(sl);
+    c.print(" HTTP/1.1\r\nHost: ");
+    c.print(host);
+    c.print("\r\nUser-Agent: JAAT-Repeater\r\nConnection: close\r\n\r\n");
+    char line[24];
+    int ln = 0;
+    uint32_t t0 = millis();
+    while ((millis() - t0) < 6000 && ln < (int)sizeof(line) - 1) {
+      if (c.available()) {
+        char ch = (char)c.read();
+        if (ch == '\n') break;
+        line[ln++] = ch;
+      } else if (!c.connected()) break;
+      else delay(5);
+    }
+    line[ln] = 0;
+    c.stop();
+    int code = 0;
+    if (strncmp(line, "HTTP/", 5) == 0 && ln > 9) code = atoi(line + 9);
+    linkCode = code;
+    if (code == 200) strcpy(linkMsg, "ok (200), IP link ho gaya");
+    else if (code > 0) snprintf(linkMsg, sizeof(linkMsg), "server ne HTTP %d diya", code);
+    else strcpy(linkMsg, "jawab nahi aaya");
+  }
+  if (linkCode == 200 && cfg.dEn && !cfg.tEn && dnsState != 1) {
+    delay(2000);       // NextDNS ko IP apply karne ka thoda time
+    enableNapt();      // DNS dobara test karo, chal gaya to clients ko mil jayega
   }
 }
 
@@ -676,6 +745,7 @@ void handleRoot() {
   else if (dnsState == 2) h += row("Client DNS", "<span class=r>Naam resolve nahi hua</span>, router wala chal raha");
   else if (dnsState == 3) h += row("Client DNS", "<span class=r>Custom DNS " + String(dnsRc < 0 ? "ne jawab nahi diya (UDP 53 band ya server band)" : "ne mana kiya (code " + String(dnsRc) + "; 5 = REFUSED: NextDNS me apna IP link karna padega)") + "</span>, router wala chal raha");
   else h += row("Client DNS", "Router judte hi lagega");
+  if (cfg.linkUrl[0]) h += row("NextDNS link", linkMsg[0] ? esc(String(linkMsg)) : String("abhi tak call nahi hua"));
   if (cfg.tEn) {
     h += row("Transparent proxy", "<span class=g>Chalu</span> (panel port " + String(PANEL_ALT_PORT) + ")");
     h += row("Tunnel", "ok " + String(tunOk) + " / fail " + String(tunFail));
@@ -728,6 +798,8 @@ void handleRoot() {
   if (cfg.dEn) h += F("checked");
   h += F("> Custom DNS chalu</label><label>DNS (IP ya hostname, jaise 8.8.8.8 ya f8cefc.dns.nextdns.io)</label><input name=dn value='");
   h += esc(String(cfg.dnsName));
+  h += F("'><label>NextDNS link URL (https://link-ip.nextdns.io/...; khali = band). Secret hai</label><input name=lu type=password value='");
+  h += esc(String(cfg.linkUrl));
   h += F("'><button type=submit>DNS save karo (restart nahi)</button></form>");
   h += F("<a class=b href='/dnstog'>");
   h += cfg.dEn ? F("DNS BAND karo") : F("DNS CHALU karo");
@@ -930,6 +1002,23 @@ void handleDnsSet() {
       "<body style='font-family:sans-serif;padding:16px'>DNS galat hai. IP (8.8.8.8) ya hostname (f8cefc.dns.nextdns.io) likho. <a href='/'>Wapas</a></body>");
     return;
   }
+  String lu = server.arg("lu");
+  lu.trim();
+  bool lbad = lu.length() > 95 || (lu.length() > 0 && !lu.startsWith("https://"));
+  for (unsigned i = 0; i < lu.length() && !lbad; i++) {
+    char c = lu[i];
+    if (c <= ' ' || c == '\'' || c == '"' || c == '<' || c == '>' || c == '\\') lbad = true;
+  }
+  if (lbad) {
+    server.send(400, "text/html",
+      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<body style='font-family:sans-serif;padding:16px'>Link URL galat hai. https://link-ip.nextdns.io/... aisa hona chahiye. <a href='/'>Wapas</a></body>");
+    return;
+  }
+  memset(cfg.linkUrl, 0, sizeof(cfg.linkUrl));
+  strncpy(cfg.linkUrl, lu.c_str(), 95);
+  lastLink = 0;       // naya URL: jaldi hi call karo
+  linkMsg[0] = 0;
   cfg.dEn = en ? 1 : 0;
   memset(cfg.dnsName, 0, sizeof(cfg.dnsName));
   strncpy(cfg.dnsName, dn.c_str(), 63);
@@ -1027,7 +1116,9 @@ void loop() {
       enableNapt();
     }
     // custom DNS pehle fail hua tha: 2 min baad dobara try
-    if (cfg.dEn && !cfg.tEn && (dnsState == 2 || dnsState == 3) && now - lastDnsTry > 120000UL) enableNapt();
+    if (cfg.dEn && !cfg.tEn && (dnsState == 2 || dnsState == 3) && older(now, lastDnsTry, 120000UL)) enableNapt();
+    // NextDNS link: har 5 min me IP update (4G ka IP badalta rehta hai)
+    if (cfg.dEn && !cfg.tEn && cfg.linkUrl[0] && netLat >= 0 && (lastLink == 0 || older(now, lastLink, 300000UL))) doLink();
 #if NET_CHECK
     if (now - lastNet > (netLat < 0 ? 10000UL : 60000UL)) {
       lastNet = now;

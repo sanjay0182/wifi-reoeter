@@ -32,7 +32,7 @@ struct Tun;   // forward declaration: Arduino auto-prototype ke liye zaroori
 // --- Speed switches (max speed test ke liye 0 karke dekho) ---
 #define LED_ENABLED 1   // 0 = LED band (CPU ka kaam kam)
 #define NET_CHECK 1     // 0 = internet ping naapna band (LED bas 'juda hai' dikhayegi)
-#define NAPT_ENTRIES 512
+#define NAPT_ENTRIES 256
 #define NAPT_PORTS 10
 #define CFG_MAGIC 0xA5A50002
 #define CFG_MAGIC2 0x5A5A0001

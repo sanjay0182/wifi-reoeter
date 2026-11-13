@@ -24,6 +24,7 @@
 #include <DNSServer.h>
 #include <WiFiUdp.h>
 #include <WiFiClientSecureBearSSL.h>
+#include "dhcpdns.h"
 
 struct Tun;   // forward declaration: Arduino auto-prototype ke liye zaroori
 
@@ -289,37 +290,9 @@ static void lockHookCheck() {
 // DHCP se clients ko 2 DNS do.
 // ESP8266 core ke alag version me DhcpServer ka function naam/type alag hai (dhcps_set_dns ya setDns,
 // ip4_addr_t* ya IPAddress). Compiler khud wahi chunta hai jo core me hai, isliye compile error nahi aata.
-template <int N> struct DPrio : DPrio<N - 1> {};
-template <> struct DPrio<0> {};
-
-template <class D>
-auto dhcpSetOne(D &d, int n, uint32_t v, DPrio<4>) -> decltype(d.dhcps_set_dns(n, (const ip4_addr_t *)nullptr), void()) {
-  ip4_addr_t x;
-  x.addr = v;
-  d.dhcps_set_dns(n, &x);
-}
-template <class D>
-auto dhcpSetOne(D &d, int n, uint32_t v, DPrio<3>) -> decltype(d.setDns(n, (const ip4_addr_t *)nullptr), void()) {
-  ip4_addr_t x;
-  x.addr = v;
-  d.setDns(n, &x);
-}
-template <class D>
-auto dhcpSetOne(D &d, int n, uint32_t v, DPrio<2>) -> decltype(d.dhcps_set_dns(n, IPAddress()), void()) {
-  d.dhcps_set_dns(n, IPAddress(v));
-}
-template <class D>
-auto dhcpSetOne(D &d, int n, uint32_t v, DPrio<1>) -> decltype(d.setDns(n, IPAddress()), void()) {
-  d.setDns(n, IPAddress(v));
-}
-template <class D>
-void dhcpSetOne(D &, int, uint32_t, DPrio<0>) {
-  Serial.println("DHCP DNS set API nahi mili");
-}
-
 static void dhcpSetDns(IPAddress a, IPAddress b) {
-  dhcpSetOne(WiFi.softAPDhcpServer(), 0, (uint32_t)a, DPrio<4>());
-  dhcpSetOne(WiFi.softAPDhcpServer(), 1, (uint32_t)b, DPrio<4>());
+  dhcpSetOne(WiFi.softAPDhcpServer(), 0, (uint32_t)a, DPrio<5>());
+  dhcpSetOne(WiFi.softAPDhcpServer(), 1, (uint32_t)b, DPrio<5>());
 }
 
 // IP ya hostname -> IP. Na mile to 0.0.0.0
